@@ -2,34 +2,9 @@
   "Mutation engine — uses rewrite-clj to find mutation sites in Clojure source
    and apply operator transforms while preserving formatting."
   (:require [cljest.operators :as ops]
+            [cljest.skip :as skip]
             [rewrite-clj.zip :as z]
             [clojure.java.io :as io]))
-
-;; ---------------------------------------------------------------------------
-;; Skippable forms
-;; ---------------------------------------------------------------------------
-
-(def ^:private skip-forms
-  "Head symbols of forms that should be skipped for mutation.
-   These are side-effect-only or meta forms where mutations are noise."
-  #{'comment 'log/info 'log/warn 'log/error 'log/debug 'log/trace
-    'println 'prn 'print 'printf
-    'taoensso.timbre/info 'taoensso.timbre/warn 'taoensso.timbre/error
-    'taoensso.timbre/debug 'taoensso.timbre/trace})
-
-(defn- in-skip-form?
-  "Check if the zipper location is inside a form that should be skipped."
-  [zloc]
-  (loop [loc (z/up zloc)]
-    (if (nil? loc)
-      false
-      (if (and (= :list (z/tag loc))
-               (let [head (z/down loc)]
-                 (and (some? head)
-                      (z/sexpr-able? head)
-                      (contains? skip-forms (z/sexpr head)))))
-        true
-        (recur (z/up loc))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Position navigation
@@ -77,8 +52,11 @@
       (if (z/end? loc)
         sites
         (let [pos (zloc-position loc)
-              ;; Only check operators if we're not in a skip-form
-              matching (when (and pos (not (in-skip-form? loc)))
+              ;; Skip mutations inside log/comment forms and at docstring
+              ;; positions — both are observationally equivalent.
+              matching (when (and pos
+                                  (not (skip/in-skip-form? loc))
+                                  (not (skip/in-docstring-position? loc)))
                          (filterv #(try
                                      ((:predicate %) loc)
                                      (catch Exception _ false))
@@ -103,7 +81,9 @@
       (if (z/end? loc)
         sites
         (let [pos (zloc-position loc)
-              matching (when pos
+              matching (when (and pos
+                                  (not (skip/in-skip-form? loc))
+                                  (not (skip/in-docstring-position? loc)))
                          (filterv #(try
                                      ((:predicate %) loc)
                                      (catch Exception _ false))

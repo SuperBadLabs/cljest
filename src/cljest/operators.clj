@@ -9,7 +9,8 @@
 
    Operators are organized into 8 categories with ~56 total operators.
    Three presets control which operators run: :fast, :standard, :comprehensive."
-  (:require [rewrite-clj.zip :as z]
+  (:require [cljest.skip :as skip]
+            [rewrite-clj.zip :as z]
             [rewrite-clj.node :as n]
             [rewrite-clj.parser :as p]))
 
@@ -92,21 +93,33 @@
    (swap-symbol :logical-or-and :logical "Replace or with and" 'or 'and)
    (swap-symbol-any-position :logical-true-false :logical "Replace true with false" true false)
    (swap-symbol-any-position :logical-false-true :logical "Replace false with true" false true)
-   ;; Negate if condition: (if cond a b) → (if (not cond) a b)
+   ;; Negate if condition: (if cond a b) → (if (not cond) a b).
+   ;; Skip when both branches are nil/missing/skip-form calls — observationally
+   ;; equivalent because flipping the condition just chooses between two
+   ;; effect-free arms.
    {:id :logical-negate-if
     :category :logical
     :description "Negate if condition"
     :predicate (fn [zloc]
                  (and (in-list-head? zloc)
                       (sexpr-is? zloc 'if)
-                      (some? (z/right zloc))))
+                      (some? (z/right zloc))
+                      (not (skip/branches-only-skip-forms? zloc))))
     :transform (fn [zloc]
                  (let [cond-zloc (z/right zloc)
                        cond-str (z/string cond-zloc)
                        negated (str "(not " cond-str ")")]
                    (z/replace cond-zloc (p/parse-string negated))))}
-   ;; when-not ↔ when
-   (swap-symbol :logical-when-not-when :logical "Replace when-not with when" 'when-not 'when)])
+   ;; when-not ↔ when. Skip when the body is exclusively log/skip-form
+   ;; calls — flipping just changes when a log line fires.
+   {:id :logical-when-not-when
+    :category :logical
+    :description "Replace when-not with when"
+    :predicate (fn [zloc]
+                 (and (in-list-head? zloc)
+                      (sexpr-is? zloc 'when-not)
+                      (not (skip/body-only-skip-forms? zloc))))
+    :transform (fn [zloc] (z/replace zloc (n/token-node 'when)))}])
 
 ;; ---------------------------------------------------------------------------
 ;; Category 4: Collections (8 operators)
@@ -129,9 +142,33 @@
 (def nil-control-operators
   [(swap-symbol :nil-nilq-someq :nil-control "Replace nil? with some?" 'nil? 'some?)
    (swap-symbol :nil-someq-nilq :nil-control "Replace some? with nil?" 'some? 'nil?)
-   (swap-symbol :nil-if-not-if :nil-control "Replace if-not with if" 'if-not 'if)
-   (swap-symbol :nil-if-if-not :nil-control "Replace if with if-not" 'if 'if-not)
-   (swap-symbol :nil-when-when-not :nil-control "Replace when with when-not" 'when 'when-not)
+   ;; if-not ↔ if and if ↔ if-not — skip when both branches are effect-free
+   ;; (nil/missing/skip-form). Same rationale as :logical-negate-if.
+   {:id :nil-if-not-if
+    :category :nil-control
+    :description "Replace if-not with if"
+    :predicate (fn [zloc]
+                 (and (in-list-head? zloc)
+                      (sexpr-is? zloc 'if-not)
+                      (not (skip/branches-only-skip-forms? zloc))))
+    :transform (fn [zloc] (z/replace zloc (n/token-node 'if)))}
+   {:id :nil-if-if-not
+    :category :nil-control
+    :description "Replace if with if-not"
+    :predicate (fn [zloc]
+                 (and (in-list-head? zloc)
+                      (sexpr-is? zloc 'if)
+                      (not (skip/branches-only-skip-forms? zloc))))
+    :transform (fn [zloc] (z/replace zloc (n/token-node 'if-not)))}
+   ;; when ↔ when-not — skip when body is exclusively skip-form calls.
+   {:id :nil-when-when-not
+    :category :nil-control
+    :description "Replace when with when-not"
+    :predicate (fn [zloc]
+                 (and (in-list-head? zloc)
+                      (sexpr-is? zloc 'when)
+                      (not (skip/body-only-skip-forms? zloc))))
+    :transform (fn [zloc] (z/replace zloc (n/token-node 'when-not)))}
    ;; Remove last arg of or (default value removal)
    {:id :nil-or-remove-default
     :category :nil-control
@@ -256,7 +293,11 @@
                       (sexpr-is? zloc 'do)
                       ;; Must have at least 2 body forms
                       (some? (z/right zloc))
-                      (some? (z/right (z/right zloc)))))
+                      (some? (z/right (z/right zloc)))
+                      ;; Skip the mutation when the form to be removed is
+                      ;; itself a skip-form call — removing a log line from
+                      ;; a do block has no observable effect.
+                      (not (skip/skip-form-head? (z/right zloc)))))
     :transform (fn [zloc]
                  ;; Remove the first form in the do body
                  (let [first-form (z/right zloc)]
