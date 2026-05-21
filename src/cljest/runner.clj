@@ -124,7 +124,15 @@
              (spit ~source-file original#)
              (try (require (quote ~source-ns) :reload) (catch Throwable _#))))
          ;; Write results to temp file
-         (spit ~results-file (pr-str @results#))))))
+         (spit ~results-file (pr-str @results#))
+         ;; Force-exit: an exercised namespace may leave lingering non-daemon
+         ;; threads (http-kit servers, executor/connection pools) that would
+         ;; otherwise pin this per-namespace JVM open and hang eval-in-project
+         ;; for the rest of the sweep. Results are already on disk, so flush
+         ;; the beacon stream and hard-halt — skipping shutdown hooks, which
+         ;; themselves can block on those same non-daemon threads.
+         (.flush System/err)
+         (.halt (Runtime/getRuntime) 0)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Execution
