@@ -21,7 +21,10 @@
    :output-format [:text]
    :skip-equivalent true      ; filter trivially equivalent mutations
    :dry-run false
-   :verbose false})
+   :verbose false
+   :resume false              ; reuse valid checkpoint entries, skip re-running
+   :checkpoint-dir nil        ; nil = "<output-dir>/checkpoint"
+   :clear-checkpoint false})  ; wipe checkpoint before running
 
 ;; ---------------------------------------------------------------------------
 ;; CLI options
@@ -44,6 +47,9 @@
     :validate [pos? "Must be positive"]]
    [nil "--output-dir DIR" "Report output directory"]
    [nil "--dry-run" "Show mutation count without running"]
+   [nil "--resume" "Resume from checkpoint: skip namespaces already completed with unchanged source/tests"]
+   [nil "--checkpoint-dir DIR" "Directory for per-namespace checkpoint files (default: <output-dir>/checkpoint)"]
+   [nil "--clear-checkpoint" "Delete existing checkpoint entries before running"]
    [nil "--verbose" "Verbose output"]
    ["-h" "--help" "Show help"]])
 
@@ -97,7 +103,10 @@
                  (assoc :source-paths (or (:source-paths project) ["src"]))
 
                  (nil? (:test-paths merged))
-                 (assoc :test-paths (or (:test-paths project) ["test"])))]
+                 (assoc :test-paths (or (:test-paths project) ["test"]))
+
+                 (nil? (:checkpoint-dir merged))
+                 (assoc :checkpoint-dir (str (:output-dir merged) "/checkpoint")))]
     (-> merged
         normalize-format
         compile-regex-patterns)))

@@ -1,7 +1,8 @@
 (ns cljest.core
   "Orchestrator — ties selector, mutator, runner, and reporter together
    into the main mutation testing pipeline."
-  (:require [cljest.config :as config]
+  (:require [cljest.checkpoint :as checkpoint]
+            [cljest.config :as config]
             [cljest.mutator :as mutator]
             [cljest.operators :as ops]
             [cljest.reporter :as reporter]
@@ -35,8 +36,15 @@
   [project config]
   (let [verbose? (:verbose config)
         dry-run? (:dry-run config)
+        resume? (:resume config)
+        checkpoint-dir (:checkpoint-dir config)
         operator-ids (ops/resolve-preset (:operators config))
         start-time (System/nanoTime)]
+
+    ;; Optionally wipe checkpoint before running
+    (when (and (:clear-checkpoint config) (not dry-run?))
+      (let [n (checkpoint/clear! checkpoint-dir)]
+        (main/info (format "  Cleared %d checkpoint entrie(s) in %s" n checkpoint-dir))))
 
     ;; Banner
     (main/info)
@@ -74,8 +82,10 @@
 
           ;; 2. Find mutation sites and optionally run
           (let [all-results (atom [])
-                total-mutations (atom 0)]
-            (doseq [{:keys [source-ns source-file test-namespaces]} targets]
+                total-mutations (atom 0)
+                resumed-count (atom 0)
+                fresh-count (atom 0)]
+            (doseq [{:keys [source-ns source-file test-namespaces] :as target} targets]
               (main/info (format "  Scanning %s ..." source-ns))
               (let [sites (mutator/find-mutation-sites source-file operator-ids)
                     mutations (mutator/expand-mutations sites)
@@ -85,20 +95,40 @@
                                    (count sites) mutation-count))
 
                 (when (and (seq mutations) (not dry-run?))
-                  (main/info (format "    Running mutations for %s ..." source-ns))
-                  (let [ns-results (runner/run-mutations-for-namespace
-                                     project source-ns source-file
-                                     test-namespaces mutations config)
-                        ;; Tag results with source info
-                        tagged (mapv #(assoc %
-                                             :source-ns source-ns
-                                             :source-file source-file)
-                                     ns-results)
-                        killed (count (filter #(#{:killed :timed-out} (:status %)) tagged))
-                        survived (count (filter #(= :survived (:status %)) tagged))]
-                    (main/info (format "    → %d killed, %d survived"
-                                       killed survived))
-                    (swap! all-results into tagged)))))
+                  (let [sig (checkpoint/signature target config)
+                        cached (when resume?
+                                 (checkpoint/load-results checkpoint-dir source-ns sig))]
+                    (if cached
+                      ;; Resume: reuse checkpointed results, skip the JVM launch
+                      (let [killed (count (filter #(#{:killed :timed-out} (:status %)) cached))
+                            survived (count (filter #(= :survived (:status %)) cached))]
+                        (main/info (format "    ↺ resumed from checkpoint: %d killed, %d survived"
+                                           killed survived))
+                        (swap! resumed-count inc)
+                        (swap! all-results into cached))
+                      ;; Run fresh, then checkpoint the results
+                      (do
+                        (main/info (format "    Running mutations for %s ..." source-ns))
+                        (let [ns-results (runner/run-mutations-for-namespace
+                                           project source-ns source-file
+                                           test-namespaces mutations config)
+                              ;; Tag results with source info
+                              tagged (mapv #(assoc %
+                                                   :source-ns source-ns
+                                                   :source-file source-file)
+                                           ns-results)
+                              killed (count (filter #(#{:killed :timed-out} (:status %)) tagged))
+                              survived (count (filter #(= :survived (:status %)) tagged))]
+                          (main/info (format "    → %d killed, %d survived"
+                                             killed survived))
+                          (checkpoint/save-results! checkpoint-dir source-ns sig tagged)
+                          (swap! fresh-count inc)
+                          (swap! all-results into tagged))))))))
+
+            (when (and (not dry-run?) (or (pos? @resumed-count) resume?))
+              (main/info)
+              (main/info (format "  Checkpoint: %d namespace(s) resumed, %d run fresh (dir: %s)"
+                                 @resumed-count @fresh-count checkpoint-dir)))
 
             ;; 3. Generate reports
             (let [duration-ns (- (System/nanoTime) start-time)
