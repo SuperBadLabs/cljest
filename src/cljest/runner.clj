@@ -45,7 +45,8 @@
 
        (let [original# (slurp ~source-file)
              results# (atom [])
-             mutation-vec# ~(vec mutation-data)]
+             mutation-vec# ~(vec mutation-data)
+             total# (count mutation-vec#)]
          (try
            (doseq [mutation# mutation-vec#]
              (let [mutated-src# (:mutated-source mutation#)
@@ -56,18 +57,40 @@
                (try
                  ;; Reload the namespace to pick up the mutation
                  (require (quote ~source-ns) :reload)
-                 ;; Run tests with timeout
-                 (let [f# (future
-                            (binding [clojure.test/*test-out* (java.io.StringWriter.)]
-                              (let [result# (apply clojure.test/run-tests
-                                                   (list ~@test-ns-forms))]
-                                {:test (:test result# 0)
-                                 :pass (:pass result# 0)
-                                 :fail (:fail result# 0)
-                                 :error (:error result# 0)})))
-                       test-result# (deref f# ~timeout-ms ::timeout)]
+                 ;; Run tests with timeout on a dedicated, low-priority daemon
+                 ;; thread. A mutation can turn a loop infinite; future-cancel only
+                 ;; *interrupts* and cannot stop a pure CPU-spin (and Thread.stop is
+                 ;; gone on JDK 21+). By running at MIN_PRIORITY as a daemon, a leaked
+                 ;; runaway can't starve the mutation loop on a multi-core box, and it
+                 ;; dies with the JVM. We interrupt on timeout (handles the common
+                 ;; interruptible cases: sleeps, blocking I/O, parking).
+                 (let [result-promise# (promise)
+                       worker# (Thread.
+                                 ^Runnable
+                                 (fn []
+                                   (try
+                                     (deliver result-promise#
+                                       (binding [clojure.test/*test-out* (java.io.StringWriter.)]
+                                         (let [result# (apply clojure.test/run-tests
+                                                              (list ~@test-ns-forms))]
+                                           {:test (:test result# 0)
+                                            :pass (:pass result# 0)
+                                            :fail (:fail result# 0)
+                                            :error (:error result# 0)})))
+                                     (catch Throwable _#
+                                       ;; Exception during the test run ⇒ treat as a
+                                       ;; failing run (mutation killed).
+                                       (deliver result-promise# {:test 0 :pass 0 :fail 1 :error 0}))))
+                                 (str "cljest-mutant-" (System/nanoTime)))
+                       _# (doto worker#
+                            (.setDaemon true)
+                            (.setPriority Thread/MIN_PRIORITY)
+                            (.start))
+                       test-result# (deref result-promise# ~timeout-ms ::timeout)]
                    (when (= test-result# ::timeout)
-                     (future-cancel f#))
+                     ;; Best-effort interrupt; daemon + MIN_PRIORITY means a
+                     ;; non-interruptible spin won't block the rest of the run.
+                     (.interrupt worker#))
                    (swap! results# conj
                           {:position pos#
                            :operator-id op-id#
@@ -86,7 +109,16 @@
                            :operator-id op-id#
                            :original-form (:original-form mutation#)
                            :status :killed
-                           :error (.getMessage e#)})))))
+                           :error (.getMessage e#)})))
+               ;; Progress beacon (to stderr) so long runs are observable and a
+               ;; stall is detectable in real time.
+               (let [done# (count @results#)
+                     last# (peek @results#)]
+                 (.println System/err
+                           (str "[cljest] " done# "/" total# " "
+                                (name (:status last# :survived)) " "
+                                (:operator-id last#)))
+                 (.flush System/err))))
            (finally
              ;; ALWAYS restore original source
              (spit ~source-file original#)
