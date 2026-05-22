@@ -69,29 +69,6 @@ This is on by default. Disable it with `--no-coverage` (or `:coverage false`) to
 run every matched test for every mutant. Typical speedups range from ~1× on
 fast/tiny suites (no test time to reclaim) to several× on slow, broad suites.
 
-### Coverage Cache
-
-The coverage map (which tests cover which source vars) is independent of which
-mutations you apply, so cljest caches it to disk and reuses it across runs —
-skipping the instrumented suite run a namespace would otherwise repeat every
-time. A cached map is reused only when the **whole project's source + test code
-is byte-identical** to when it was captured: coverage depends on the behavior of
-all code reachable from the tests (an integration test can reach a var through
-several namespaces), so any code change conservatively invalidates the cache and
-coverage is recomputed. This keeps the cache verdict-safe — a stale or corrupt
-entry degrades to the full-suite fallback and never changes a kill/survive
-result.
-
-Because the key is the *code* state and not the run parameters, the cache
-survives `--operators`/`--threshold`/`--timeout` changes and `--resume`, so
-re-running the same checkout (CI retries, switching operator presets, tuning the
-threshold) pays the coverage cost only once. It does **not** speed up the
-edit-one-file-and-re-run loop — any edit invalidates the project signature;
-sound per-namespace invalidation needs the dependency graph (tracked separately).
-
-On by default. Disable with `--no-coverage-cache` (or `:coverage-cache false`).
-Entries live under `<output-dir>/coverage-cache`.
-
 ## Configuration
 
 Add a `:cljest` key to your `project.clj`:
@@ -105,8 +82,7 @@ Add a `:cljest` key to your `project.clj`:
          :output-dir "target/cljest"
          :output-format [:text :html]
          :skip-equivalent true
-         :coverage true                     ; coverage-guided test selection
-         :coverage-cache true}              ; reuse coverage maps across runs
+         :coverage true}                    ; coverage-guided test selection
 ```
 
 ## CLI Options
@@ -121,7 +97,6 @@ Add a `:cljest` key to your `project.clj`:
   --output-dir DIR            Report output directory [default: target/cljest]
   --dry-run                   Show mutation count without running
   --no-coverage               Disable coverage-guided test selection
-  --no-coverage-cache         Disable the cross-run coverage cache
   --jobs N                    Mutate N namespaces in parallel [default: 1]
   --batch-size N              Shard a namespace into mutant batches above N [default: 50]
   --private-tmp MODE          Per-worker private /tmp: auto|off|unshare|sudo [default: auto]

@@ -161,11 +161,11 @@
                 ;; its last mutant-batch completes.
                 ns-acc (atom {})
                 process-unit
-                (fn [{:keys [source-ns source-file test-namespaces mutations sig n-batches cov-cache]}]
+                (fn [{:keys [source-ns source-file test-namespaces mutations sig n-batches]}]
                   (let [t0 (System/nanoTime)
                         ns-results (runner/run-mutations-for-namespace
                                      launch-ctx source-ns source-file
-                                     test-namespaces mutations config cov-cache)
+                                     test-namespaces mutations config)
                         elapsed-ms (quot (- (System/nanoTime) t0) 1000000)
                         tagged (mapv #(assoc % :source-ns source-ns :source-file source-file)
                                      ns-results)]
@@ -193,18 +193,6 @@
             ;; through one pool — so a single slow namespace can't bound the
             ;; makespan.
             (let [batch-size (:batch-size config 50)
-                  ;; Coverage cache (PERF-007): a per-namespace coverage map is
-                  ;; reused across runs when the whole-project source+test tree
-                  ;; is unchanged, skipping the instrumented suite run. Keyed by
-                  ;; one project-wide signature (coverage is reachability-wide,
-                  ;; so per-ns hashing would be unsound). Off in dry-run / when
-                  ;; coverage or the cache is disabled.
-                  cache-on? (and (not dry-run?)
-                                 (:coverage config true)
-                                 (:coverage-cache config true))
-                  cov-cache-dir (str (:output-dir config) "/coverage-cache")
-                  proj-sig (when cache-on?
-                             (checkpoint/project-coverage-signature targets config))
                   targets+ (->> targets
                                 (pmap (fn [t]
                                         (let [sites (mutator/find-mutation-sites
@@ -214,13 +202,6 @@
                                                  :sites-count (count sites)
                                                  :mutations muts
                                                  :sig (checkpoint/signature t config)
-                                                 :cov-cache
-                                                 (when cache-on?
-                                                   {:file (checkpoint/coverage-cache-path
-                                                            cov-cache-dir (:source-ns t))
-                                                    :sig proj-sig
-                                                    :hit? (checkpoint/coverage-cache-valid?
-                                                            cov-cache-dir (:source-ns t) proj-sig)})
                                                  :cost (or (checkpoint/load-elapsed
                                                              checkpoint-dir (:source-ns t))
                                                            (* (count muts) 200))))))
@@ -250,15 +231,6 @@
                                     source-ns killed survived))
                       (swap! resumed-count inc)
                       (swap! all-results into c)))
-                  (when cache-on?
-                    (let [to-run (remove #(contains? cached (:source-ns %)) targets+)
-                          hits (count (filter #(get-in % [:cov-cache :hit?]) to-run))]
-                      (main/info
-                        (if (pos? hits)
-                          (format "  Coverage cache: %d/%d namespace(s) reuse cached coverage (project unchanged)"
-                                  hits (count to-run))
-                          (format "  Coverage cache: cold — computing + caching coverage for %d namespace(s)"
-                                  (count to-run))))))
                   (when (> jobs 1)
                     (main/info (format "  Running %d work unit(s) across %d job(s), longest-first scheduling"
                                        (count units) jobs)))

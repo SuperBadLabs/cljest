@@ -23,17 +23,14 @@
 (defn- coverage-capture-form
   "Return a form that, evaluated in the project JVM against the ORIGINAL
    (unmutated) source, returns a map of source-var-name (symbol) -> set of
-   covering test-var SYMBOLS (fully-qualified, e.g. my.ns-test/my-test).
+   covering test vars.
 
    It temporarily wraps every fn-valued var in the source namespace so that
    each invocation attributes itself to the currently-running test
    (clojure.test/*testing-vars*), runs the whole matched suite exactly once,
    then restores the originals. Because attribution is by var invocation,
    transitive calls are captured: any test whose execution reaches `foo`
-   (directly or indirectly) is recorded as covering `foo`.
-
-   Symbols (not var objects) are recorded so the map can be serialized to the
-   coverage cache and read back on a later run (CLJEST-PERF-007)."
+   (directly or indirectly) is recorded as covering `foo`."
   [source-ns test-ns-forms]
   `(let [cov# (atom {})
          src-vars# (->> (ns-interns (quote ~source-ns))
@@ -51,10 +48,7 @@
                          (fn [_#]
                            (fn [& args#]
                              (when-let [tv# (peek clojure.test/*testing-vars*)]
-                               (let [m# (meta tv#)]
-                                 (swap! cov# update vname# (fnil conj #{})
-                                        (symbol (str (ns-name (:ns m#)))
-                                                (str (:name m#))))))
+                               (swap! cov# update vname# (fnil conj #{}) tv#))
                              (apply orig# args#))))))
      (try
        (binding [clojure.test/*report-counters* (ref clojure.test/*initial-report-counters*)
@@ -90,16 +84,8 @@
                               :enclosing-var sym-or-nil}
      timeout-ms     — long, per-mutation test timeout
      results-file   — string, path to write EDN results
-     coverage?      — boolean, enable coverage-guided test selection
-     cache-file     — string or nil; coverage cache entry path. On a cache HIT
-                      the map is read from here (no suite run); otherwise, when
-                      coverage is captured inline, the computed map is written
-                      here stamped with cache-sig for the next run (PERF-007)
-     cache-sig      — string or nil; whole-project signature to stamp on write
-     cache-hit?     — boolean; orchestrator pre-validated cache-file's sig, so
-                      read the map from it instead of running the suite"
-  [source-ns source-file test-nses mutations timeout-ms results-file coverage?
-   cache-file cache-sig cache-hit?]
+     coverage?      — boolean, enable coverage-guided test selection"
+  [source-ns source-file test-nses mutations timeout-ms results-file coverage?]
   (let [test-ns-forms (mapv (fn [ns] `(quote ~ns)) test-nses)
         mutation-data (mapv (fn [m]
                               {:position (:position m)
@@ -110,7 +96,7 @@
                                                 (str ev))})
                             mutations)]
     `(do
-       (require 'clojure.test 'clojure.edn 'clojure.java.io)
+       (require 'clojure.test)
        ;; Require all test namespaces upfront
        ~@(for [tns test-nses]
            `(require (quote ~tns)))
@@ -124,36 +110,14 @@
                                        [_# v#] (ns-interns tns#)
                                        :when (:test (meta v#))]
                                    v#))
-             ;; var-name -> #{covering test-var symbol}; empty map disables
-             ;; selection. On a cache HIT read the map from disk (no suite run);
-             ;; otherwise capture it inline and persist it for the next run
-             ;; (CLJEST-PERF-007). A read failure degrades to {} → full-suite
-             ;; fallback, so a corrupt cache can never change a verdict.
-             coverage# ~(cond
-                          cache-hit?
-                          `(try (:coverage (clojure.edn/read-string (slurp ~cache-file)))
-                                (catch Throwable _# {}))
-
-                          coverage?
-                          ;; One explicit gensym shared across both quote levels
-                          ;; (auto-gensym `m#` would differ per syntax-quote).
-                          (let [msym (gensym "cov")]
-                            `(let [~msym ~(coverage-capture-form source-ns test-ns-forms)]
-                               ~(when cache-file
-                                  `(try
-                                     (clojure.java.io/make-parents (clojure.java.io/file ~cache-file))
-                                     (let [tmp# (str ~cache-file ".tmp." (System/nanoTime))]
-                                       (spit tmp# (pr-str {:sig ~cache-sig :coverage ~msym}))
-                                       (.renameTo (clojure.java.io/file tmp#)
-                                                  (clojure.java.io/file ~cache-file)))
-                                     (catch Throwable _#)))
-                               ~msym))
-
-                          :else {})]
+             ;; var-name -> #{covering test var}; empty map disables selection.
+             coverage# ~(if coverage?
+                          (coverage-capture-form source-ns test-ns-forms)
+                          {})]
          (.println System/err
                    (str "[cljest] coverage: " (count coverage#) " covered var(s), "
                         (count all-test-vars#) " test var(s)"
-                        ~(cond cache-hit? " (cached)" coverage? "" :else " (disabled)")))
+                        ~(if coverage? "" " (disabled)")))
          (.flush System/err)
          (try
            (doseq [mutation# mutation-vec#]
@@ -162,14 +126,10 @@
                    pos# (:position mutation#)
                    enc# (:enclosing-var mutation#)
                    ;; Only narrow to covering tests when we have positive
-                   ;; coverage evidence; otherwise run everything. Coverage
-                   ;; stores test-var symbols, so resolve them to vars here.
+                   ;; coverage evidence; otherwise run everything.
                    sel-vars# (let [k# (when enc# (symbol enc#))]
                                (if (and k# (contains? coverage# k#))
-                                 (vec (keep (fn [tsym#]
-                                              (try (requiring-resolve tsym#)
-                                                   (catch Throwable _# nil)))
-                                            (get coverage# k#)))
+                                 (vec (get coverage# k#))
                                  all-test-vars#))]
                (try
                  ;; Apply the mutant in-memory by re-evaluating the full
@@ -403,12 +363,9 @@
      test-nses  — vec of test namespace symbols
      mutations  — seq of expanded mutation maps from mutator/expand-mutations
      config     — resolved config map
-     cov-cache  — {:file <path> :sig <project-sig> :hit? <bool>} or nil; coverage
-                  cache wiring (PERF-007). :hit? true ⇒ read the map from :file;
-                  else capture inline and (when :file) persist it stamped :sig.
 
    Returns a vec of result maps with :status :killed/:survived/:timed-out/:error."
-  [launch-ctx src-ns src-file test-nses mutations config cov-cache]
+  [launch-ctx src-ns src-file test-nses mutations config]
   (let [worktmp (io/file (:target-path launch-ctx) "cljest-par"
                          (str (java.util.UUID/randomUUID)))
         _ (.mkdirs worktmp)
@@ -450,8 +407,7 @@
       ;; namespaces, and the source namespace itself).
       (let [form (build-mutation-form src-ns src-file test-nses
                                       valid-mutations timeout-ms results-file
-                                      coverage?
-                                      (:file cov-cache) (:sig cov-cache) (:hit? cov-cache))]
+                                      coverage?)]
         ;; Launch as an independent subprocess — no shared Leiningen machinery,
         ;; so parallel workers actually run concurrently.
         (try
