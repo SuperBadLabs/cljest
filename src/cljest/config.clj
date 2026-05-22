@@ -20,6 +20,7 @@
    :output-dir "target/cljest"
    :output-format [:text]
    :skip-equivalent true      ; filter trivially equivalent mutations
+   :since nil                 ; git ref: mutate only sites changed vs ref (INC-001)
    :coverage true             ; coverage-guided test selection (only run covering tests)
    :jobs 1                    ; number of namespaces to mutate in parallel
    :batch-size 50             ; shard a namespace into mutant batches above this size
@@ -38,6 +39,7 @@
   "Command-line option definitions."
   [[nil "--namespaces REGEX" "Regex to filter source namespaces"]
    [nil "--exclude-namespaces REGEX" "Regex to exclude source namespaces"]
+   [nil "--since REF" "Incremental: mutate only sites on lines changed vs this git ref"]
    [nil "--threshold N" "Minimum mutation score (%)"
     :parse-fn #(Integer/parseInt %)
     :validate [#(<= 0 % 100) "Must be 0-100"]]

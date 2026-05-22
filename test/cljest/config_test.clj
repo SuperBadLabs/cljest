@@ -120,6 +120,15 @@
     (let [config (cfg/resolve-config {} ["--timeout" "5000"])]
       (is (= 5000 (:timeout config))))))
 
+(deftest since-defaults-nil
+  (testing ":since defaults to nil (full sweep)"
+    (is (nil? (:since (cfg/resolve-config {} []))))))
+
+(deftest cli-since-sets-ref
+  (testing "--since REF captures the git ref for incremental scoping"
+    (let [config (cfg/resolve-config {} ["--since" "origin/main"])]
+      (is (= "origin/main" (:since config))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Validation
 ;; ---------------------------------------------------------------------------

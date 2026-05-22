@@ -43,7 +43,7 @@ Every one of those is a gap to close *inside* cljest. This board does that.
 | CLJEST-PERF-003 | P1 | DEFERRED | PERF-002 | **Warm worker JVMs.** Reuse pre-warmed project JVM(s) across namespaces instead of a cold subprocess per batch; recycle on leak/wedge. | ⏸️ **Deferred — probe shows a ~6% ceiling.** Per-batch fixed cost on the bottleneck (`web.saml`, fresh JVM): boot ~2s + `require` 1.76s + private-/tmp mount ~0.5s = **~4.3s amortizable**, but the dominant fixed cost is the **~15.7s coverage suite run, which is NOT amortizable** (each heavy-namespace batch lands on a different idle worker → recomputes coverage; same cross-batch wall PERF-006 hit). Ceiling ≈ 4.3s × (≈395 units − 16 workers) ÷ 16 ≈ **~1.5–2 min (~6%)**, against a persistent-worker IPC + work-stealing + wedge/respawn protocol. Not worth it yet. |
 | CLJEST-PERF-007 | P1 | ~~REJECTED~~ | PERF-001 | **Persistent coverage cache.** ~~Cache the per-namespace coverage map to disk, reuse across runs, keyed by a whole-project source+test signature.~~ Built, verdict-safe, tested (cold→warm `web.mfa`: identical 105/46/69.5%, cache reused, ~5% coverage reclaimed) — **but rejected as not worth the moving part.** The sound whole-project key invalidates on *any* code change, so it does **nothing** for cold runs (every PR is a new commit) or the common edit-one-file dev loop; it only helps **byte-identical** re-runs (CI retries, `--operators` preset switches, `--resume`) for ~5%. Same marginal bar that rejected PERF-006 and deferred PERF-003. It is also **not** a real foundation for INC-001 (which needs *per-namespace* dep-graph invalidation, the opposite of invalidate-all). Pure-upside and safe, but a cache layer + soundness argument isn't justified by ~5% on an uncommon workflow. Code reverted; the parallelism unit tests it introduced were kept. | ❌ Marginal: ~5% on byte-identical re-runs only; nothing for cold runs or the dev loop. The dev-loop coverage win lives in INC-001. |
 | CLJEST-ROB-001 | P1 | TODO | — | **Mutation-level streaming + resume.** Stream each result to disk as it completes (`runner.clj:127` writes once at the end); extend checkpoint to mutation granularity. | Kill mid-namespace, `--resume` re-runs only the unfinished mutants of that namespace, not the whole namespace. |
-| CLJEST-INC-001 | P1 | TODO | — | **Git-diff-aware incremental mode.** `--since REF` mutates only sites on lines changed vs a ref. | PR-scoped run mutates only changed code; documented; verdicts match a full run restricted to those sites. |
+| CLJEST-INC-001 | P1 | DONE | — | **Git-diff-aware incremental mode.** `--since REF` mutates only sites on lines changed vs a ref (the PR-gate workload). Pure unified-diff parser (`cljest.incremental`) extracts changed new-side line ranges; core filters each namespace's mutations to those lines and skips namespaces with no changed sites. | ✅ Real 202-ns project, one-line PR change: **full sweep 14,340 mutations / 27m44s → `--since HEAD` 3 mutations / 3.7s** (~450×, 99.8% less work), all 3 killed. Verdict-equivalent by construction — only the mutation *list* is filtered; per-mutant evaluation (coverage capture + test selection) is byte-identical. Composes with `--jobs`/`--operators`/`--threshold`. 12 new unit tests (diff-parser hunk math incl. pure-deletion / new-file / `/dev/null` / multi-hunk + line-filter). Suite 158 → 170. Evidence in Progress Log 2026-05-22. |
 | CLJEST-RPT-001 | P2 | TODO | — | **Survivor drill-down report.** HTML/text per surviving mutant: file, line, operator, original→mutated diff, and which tests ran; grouped by namespace/operator. | A reviewer can act on every survivor without rerunning; HTML diff view ships. |
 | CLJEST-EQV-001 | P2 | TODO | — | **Equivalent-mutant handling.** Better trivial-equivalence heuristics + a `.cljest-ignore` suppression file for known won't-fix/equivalent mutants. | Suppressed mutants excluded from the denominator with an audit trail; documented format. |
 | CLJEST-RPT-002 | P2 | TODO | — | **Machine-readable output + trend.** Emit JSON/EDN report; append score history per run. | CI can parse the score; a trend file updates each run; schema documented. |
@@ -212,3 +212,24 @@ EQV-001 (equivalents), RPT-002 (JSON+trend), DX-001 (GH Action), OPS-001
   jobs, proportional cost) and `parallel-doseq` (runs every item once at jobs=1
   and jobs>1, propagates worker exceptions) in `test/cljest/core_test.clj`. Suite
   149 → 158 tests, 0 failures. The dev-loop coverage win is deferred to INC-001.
+- 2026-05-22: `CLJEST-INC-001` DONE — and the FINAL cljest feature (side-quest
+  closed). `--since REF` scopes mutation to git-changed lines for the PR-gate
+  workflow. `cljest.incremental` has a pure `parse-unified-diff` (parses
+  `git diff --unified=0` into {path -> #{new-side changed lines}}; handles
+  pure-deletion `+c,0`, count-defaults-to-1, new files vs `/dev/null`,
+  multi-hunk/multi-file) + `changed-lines` (abs paths via repo root) +
+  `filter-mutations`; `core` computes the changed map once, filters each
+  namespace's mutations, skips namespaces with no changed sites, and aborts
+  loudly on a bad ref / non-git tree. Verdict-equivalent by construction: only
+  the mutation LIST is filtered — per-mutant evaluation (coverage capture, test
+  selection, kill/survive) is the unchanged PERF-004 path.
+  Validation (real chengis shard, 202 ns; behavior-preserving one-line edit to
+  `chengis.db.pagination` `paginated-response`):
+  - `--since HEAD`: scoped to 1 namespace / 3 changed mutation sites, 3 killed
+    (100%), **wall 3.69s**.
+  - vs full sweep 14,340 mutations / 27m44s (1664s) → **~450× less work,
+    99.8% reduction**. Measured against the PR-scoped baseline agreed up front.
+  - 12 new unit tests (`incremental_test`: 10 parser/filter; `config_test`: 2
+    `--since`). Suite 158 → 170, 0 failures.
+  Acceptance bar (>=25% vs full sweep, else revert): cleared by a wide margin.
+  This was the agreed last side-quest change to cljest.

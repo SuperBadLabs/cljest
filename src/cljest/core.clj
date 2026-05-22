@@ -3,6 +3,7 @@
    into the main mutation testing pipeline."
   (:require [cljest.checkpoint :as checkpoint]
             [cljest.config :as config]
+            [cljest.incremental :as incremental]
             [cljest.mutator :as mutator]
             [cljest.operators :as ops]
             [cljest.reporter :as reporter]
@@ -193,11 +194,23 @@
             ;; through one pool — so a single slow namespace can't bound the
             ;; makespan.
             (let [batch-size (:batch-size config 50)
+                  ;; Incremental scoping (INC-001): when --since is set, compute
+                  ;; the changed-line map ONCE and keep only mutations on changed
+                  ;; lines. nil means "not a git tree / bad ref" — abort loudly
+                  ;; rather than silently mutate everything (or nothing).
+                  since (:since config)
+                  changed (when since (incremental/changed-lines since))
+                  _ (when (and since (nil? changed))
+                      (main/abort (format "  --since %s: could not diff against ref (not a git work tree, or unknown ref)" since)))
                   targets+ (->> targets
                                 (pmap (fn [t]
                                         (let [sites (mutator/find-mutation-sites
                                                       (:source-file t) operator-ids)
-                                              muts (vec (mutator/expand-mutations sites))]
+                                              all-muts (vec (mutator/expand-mutations sites))
+                                              muts (if since
+                                                     (incremental/filter-mutations
+                                                       changed (:source-file t) all-muts)
+                                                     all-muts)]
                                           (assoc t
                                                  :sites-count (count sites)
                                                  :mutations muts
@@ -205,8 +218,16 @@
                                                  :cost (or (checkpoint/load-elapsed
                                                              checkpoint-dir (:source-ns t))
                                                            (* (count muts) 200))))))
-                                vec)]
-              (doseq [{:keys [source-ns sites-count mutations]} targets+]
+                                vec)
+                  ;; In --since mode most namespaces have zero changed sites;
+                  ;; only surface the ones that actually contribute mutations.
+                  scanned (if since (filter #(seq (:mutations %)) targets+) targets+)]
+              (when since
+                (main/info (format "  Incremental (--since %s): %d changed mutation site(s) across %d namespace(s)"
+                                   since
+                                   (reduce + (map (comp count :mutations) scanned))
+                                   (count scanned))))
+              (doseq [{:keys [source-ns sites-count mutations]} scanned]
                 (swap! total-mutations + (count mutations))
                 (log! (format "  Scanning %s ... %d site(s), %d mutation(s)"
                               source-ns sites-count (count mutations))))
