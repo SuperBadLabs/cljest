@@ -100,8 +100,7 @@
            `(require (quote ~tns)))
        (require (quote ~source-ns))
 
-       (let [original# (slurp ~source-file)
-             results# (atom [])
+       (let [results# (atom [])
              mutation-vec# ~(vec mutation-data)
              total# (count mutation-vec#)
              ;; Full test-var set — the fallback whenever coverage is unknown.
@@ -130,11 +129,13 @@
                                (if (and k# (contains? coverage# k#))
                                  (vec (get coverage# k#))
                                  all-test-vars#))]
-               ;; Write mutated source
-               (spit ~source-file mutated-src#)
                (try
-                 ;; Reload the namespace to pick up the mutation
-                 (require (quote ~source-ns) :reload)
+                 ;; Apply the mutant in-memory by re-evaluating the full
+                 ;; mutated source (its own ns form + defs). This is
+                 ;; equivalent to a file reload but NEVER writes to the
+                 ;; working tree, so an interrupted/killed run can never
+                 ;; leave a mutation baked into the real source file.
+                 (load-string mutated-src#)
                  ;; Run tests with timeout on a dedicated, low-priority daemon
                  ;; thread. A mutation can turn a loop infinite; future-cancel only
                  ;; *interrupts* and cannot stop a pure CPU-spin (and Thread.stop is
@@ -199,8 +200,10 @@
                                 (:operator-id last#)))
                  (.flush System/err))))
            (finally
-             ;; ALWAYS restore original source
-             (spit ~source-file original#)
+             ;; The working source file was never modified (mutants are applied
+             ;; in-memory via load-string), so there is nothing to restore. We
+             ;; still reload from the pristine on-disk source to leave this JVM's
+             ;; namespace state matching the real file.
              (try (require (quote ~source-ns) :reload) (catch Throwable _#))))
          ;; Write results to temp file
          (spit ~results-file (pr-str @results#))

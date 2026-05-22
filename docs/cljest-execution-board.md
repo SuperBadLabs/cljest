@@ -34,7 +34,7 @@ Every one of those is a gap to close *inside* cljest. This board does that.
 | ID | Pri | Status | Depends on | Work Item | Definition of Done |
 |---|---|---|---|---|---|
 | CLJEST-PERF-001 | P0 | DONE | — | **Coverage-guided test selection.** Today every mutant reruns *all* matched test namespaces (`runner.clj:74`). Capture per-test line/form coverage once, then for each mutant run only the tests that exercise the mutated site. | ✅ Mutants run only covering tests, with all-tests fallback on unknown coverage; verdicts identical to full-run on fixture + real namespaces; ≥3× on benchmark, 2.0× on a real 29-min namespace. Evidence in Progress Log 2026-05-21. |
-| CLJEST-ISO-001 | P0 | TODO | — | **Out-of-tree mutation.** Stop `spit`-ing mutants into the working `src/` (`runner.clj:56,124`). Mutate a shadow copy / overlay classpath dir; never touch the checkout. | A `kill -9` mid-run leaves `git status` clean; contamination guard removed from all workflows; fixture verdicts unchanged. |
+| CLJEST-ISO-001 | P0 | DONE | — | **Out-of-tree mutation.** Stop `spit`-ing mutants into the working `src/`. Apply each mutant in-memory via `load-string` (re-evaluates the full mutated file text); the real source file is read-only input. | ✅ `kill -9` mid-run leaves source pristine (vs 0.1.0 which leaves it mutated); verdicts unchanged (fixture 16/6, real pagination 26/2); contamination guard no longer needed. Evidence in Progress Log 2026-05-21. |
 | CLJEST-PERF-002 | P0 | TODO | ISO-001 | **Native parallel execution.** Add a `--jobs N` worker pool that runs namespaces (and/or mutation batches) concurrently, each with isolated tmp/DB/source. Removes the need for external Docker sharding. | Repo-wide sweep parallelizes in-process to core count; near-linear speedup to ~16 jobs; no shared-state corruption (DB/tmp). |
 | CLJEST-PERF-003 | P1 | TODO | PERF-002 | **Warm worker JVMs.** Reuse pre-warmed project JVM(s) across namespaces instead of a cold `eval-in-project` per namespace; recycle on leak/wedge. | Per-namespace cold-start cost amortized; measured wall-clock reduction on the full sweep; wedge recovery still safe (halt + respawn). |
 | CLJEST-ROB-001 | P1 | TODO | — | **Mutation-level streaming + resume.** Stream each result to disk as it completes (`runner.clj:127` writes once at the end); extend checkpoint to mutation granularity. | Kill mid-namespace, `--resume` re-runs only the unfinished mutants of that namespace, not the whole namespace. |
@@ -86,3 +86,17 @@ EQV-001 (equivalents), RPT-002 (JSON+trend), DX-001 (GH Action), OPS-001
   - `chengis.engine.iac` (302): 83/219 both; ~10s both (fast suite, no harm).
   - `chengis.db.pagination`: 26/2 both; 2.4s both (fast suite, no harm).
   Released under version 0.2.0-SNAPSHOT.
+- 2026-05-21: `CLJEST-ISO-001` DONE. `src/cljest/runner.clj` no longer writes
+  the working source file: each mutant is applied with `(load-string
+  mutated-src)` (re-evaluates the full mutated file — ns form + defs — exactly
+  like a reload, but in-memory), and the file-restore `finally` is gone. The
+  real source file is now read-only input. Validation (fixture, killed at
+  mutant ~5):
+  - 0.2.0-SNAPSHOT: source md5 unchanged after `kill -9` mid-run (PASS).
+  - 0.1.0 (spit-based) on the same kill: source LEFT MUTATED
+    (`(> a b)` baked to `(< a b)`) — the exact contamination this fixes.
+  - Verdicts unchanged: fixture 16 killed/6 survived; real
+    `chengis.db.pagination` 26/2 (92.9%); working tree clean after a normal run.
+  Consequence: the `git checkout HEAD -- src/` contamination guard is no longer
+  needed in any launcher/workflow, and CLJEST-PERF-002 (parallel execution) is
+  unblocked — concurrent mutants can no longer corrupt a shared checkout.

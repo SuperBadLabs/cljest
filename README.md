@@ -42,12 +42,15 @@ lein cljest --format html
 2. **Scan** source code for mutation sites using rewrite-clj
 3. **Capture coverage** (once): run the matched suite with the source namespace
    instrumented to learn which tests exercise which function
-4. **For each mutation**: overwrite the source file, reload the namespace, and
-   run only the tests that cover the mutated function (see *Coverage-Guided
-   Selection* below)
+4. **For each mutation**: apply the mutant in-memory (`load-string`) — the
+   working source file is never written — and run only the tests that cover the
+   mutated function (see *Coverage-Guided Selection* below)
 5. **Record** whether tests caught the mutation (killed) or missed it (survived)
-6. **Restore** the original source (guaranteed via `finally` block)
-7. **Report** mutation score with details on surviving mutations
+6. **Report** mutation score with details on surviving mutations
+
+Mutations are applied in-memory and the working source file is treated as
+read-only input, so an interrupted or `kill -9`'d run can never leave a mutation
+baked into your checkout — no cleanup or restore step required.
 
 ## Coverage-Guided Selection
 
