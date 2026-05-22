@@ -21,6 +21,7 @@
    :output-format [:text]
    :skip-equivalent true      ; filter trivially equivalent mutations
    :coverage true             ; coverage-guided test selection (only run covering tests)
+   :coverage-cache true       ; reuse cached coverage maps across runs (PERF-007)
    :jobs 1                    ; number of namespaces to mutate in parallel
    :batch-size 50             ; shard a namespace into mutant batches above this size
    :private-tmp :auto         ; per-worker private /tmp: :auto | :off | :unshare | :sudo
@@ -62,6 +63,8 @@
    [nil "--dry-run" "Show mutation count without running"]
    [nil "--no-coverage" "Disable coverage-guided test selection (run all matched tests per mutant)"
     :id :coverage :update-fn (constantly false)]
+   [nil "--no-coverage-cache" "Disable the cross-run coverage cache (always recompute coverage)"
+    :id :coverage-cache :update-fn (constantly false)]
    [nil "--resume" "Resume from checkpoint: skip namespaces already completed with unchanged source/tests"]
    [nil "--checkpoint-dir DIR" "Directory for per-namespace checkpoint files (default: <output-dir>/checkpoint)"]
    [nil "--clear-checkpoint" "Delete existing checkpoint entries before running"]

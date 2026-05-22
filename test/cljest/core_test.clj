@@ -30,6 +30,16 @@
     ((resolve 'cljest.core/run-mutation-testing) project config)
     (throw (ex-info "cljest.core could not be loaded" {}))))
 
+(defn- make-work-units
+  "Dynamically invoke the private cljest.core/make-work-units."
+  [target jobs batch-size]
+  ((resolve 'cljest.core/make-work-units) target jobs batch-size))
+
+(defn- parallel-doseq
+  "Dynamically invoke the private cljest.core/parallel-doseq."
+  [jobs f coll]
+  ((resolve 'cljest.core/parallel-doseq) jobs f coll))
+
 ;; ---------------------------------------------------------------------------
 ;; Fixtures / helpers
 ;; ---------------------------------------------------------------------------
@@ -152,3 +162,108 @@
         (is (= [] (:results result)))
         (is (true? (get-in result [:config :dry-run]))))
       (println "  [SKIP] cljest.core not available — operators.clj compilation issue"))))
+
+;; ---------------------------------------------------------------------------
+;; Mutation-level sharding — make-work-units (CLJEST-PERF-004)
+;;
+;; The schedulable unit is a mutant-batch, not a namespace. These pin the
+;; sharding math: when a namespace splits, when it doesn't, the batch-count
+;; bound, and that NO mutation is lost or duplicated across batches (a split
+;; bug would silently drop mutations and inflate the score).
+;; ---------------------------------------------------------------------------
+
+(deftest work-units-single-when-jobs-1
+  (testing "jobs<=1 ⇒ one whole-namespace unit regardless of size"
+    (when core-available?
+      (let [target {:source-ns 'app.core :mutations (vec (range 500)) :cost 1000}
+            units (vec (make-work-units target 1 50))]
+        (is (= 1 (count units)))
+        (is (= 1 (:n-batches (first units))))
+        (is (= (vec (range 500)) (:mutations (first units))))))))
+
+(deftest work-units-single-when-under-batch-size
+  (testing "n <= batch-size ⇒ one unit even with many jobs"
+    (when core-available?
+      (let [target {:source-ns 'app.core :mutations (vec (range 50)) :cost 800}
+            units (vec (make-work-units target 16 50))]
+        (is (= 1 (count units)))
+        (is (= 1 (:n-batches (first units))))))))
+
+(deftest work-units-shards-large-namespace
+  (testing "n > batch-size ⇒ ceil(n/batch-size) batches, bounded by jobs"
+    (when core-available?
+      (let [target {:source-ns 'app.core :mutations (vec (range 120)) :cost 24000}
+            units (vec (make-work-units target 16 50))]
+        ;; ceil(120/50) = 3, min(16,3) = 3
+        (is (= 3 (count units)))
+        (is (every? #(= 3 (:n-batches %)) units))))))
+
+(deftest work-units-batch-count-bounded-by-jobs
+  (testing "batch count never exceeds jobs"
+    (when core-available?
+      (let [target {:source-ns 'app.core :mutations (vec (range 1000)) :cost 200000}
+            units (vec (make-work-units target 4 50))]
+        ;; ceil(1000/50) = 20, but jobs caps at 4
+        (is (= 4 (count units)))
+        (is (every? #(= 4 (:n-batches %)) units))))))
+
+(deftest work-units-partition-is-lossless
+  (testing "batches partition the mutations exactly — no loss, no duplication"
+    (when core-available?
+      (let [muts (vec (range 137))
+            target {:source-ns 'app.core :mutations muts :cost 27400}
+            units (vec (make-work-units target 8 50))
+            recombined (mapcat :mutations units)]
+        (is (= muts (vec recombined)) "concatenated batches reconstruct the original, in order")
+        (is (= (count muts) (count recombined)) "no mutation dropped or duplicated")))))
+
+(deftest work-units-cost-is-split-proportionally
+  (testing "a sharded unit's :unit-cost is proportional to its share of mutations"
+    (when core-available?
+      (let [target {:source-ns 'app.core :mutations (vec (range 100)) :cost 10000}
+            units (vec (make-work-units target 2 50))
+            total (reduce + (map :unit-cost units))]
+        (is (= 2 (count units)))
+        ;; two equal halves of a 10000 cost ⇒ ~5000 each, summing to ~10000
+        (is (< (Math/abs (- 10000.0 total)) 1.0))))))
+
+;; ---------------------------------------------------------------------------
+;; Worker pool — parallel-doseq (CLJEST-PERF-002)
+;;
+;; Concurrency correctness of the dispatch primitive: every item runs exactly
+;; once, jobs<=1 stays sequential on the calling thread, and the first worker
+;; exception surfaces to the caller (a swallowed exception would silently drop
+;; a namespace's results).
+;; ---------------------------------------------------------------------------
+
+(deftest parallel-doseq-runs-every-item-once-sequential
+  (testing "jobs=1 processes every item exactly once"
+    (when core-available?
+      (let [seen (atom [])]
+        (parallel-doseq 1 #(swap! seen conj %) (range 100))
+        (is (= (set (range 100)) (set @seen)))
+        (is (= 100 (count @seen)))))))
+
+(deftest parallel-doseq-runs-every-item-once-parallel
+  (testing "jobs>1 processes every item exactly once (no loss, no double-run)"
+    (when core-available?
+      (let [n 200
+            seen (atom #{})
+            calls (java.util.concurrent.atomic.AtomicInteger. 0)]
+        (parallel-doseq 8
+                        (fn [x]
+                          (.incrementAndGet calls)
+                          ;; a little jitter to encourage interleaving
+                          (when (zero? (mod x 7)) (Thread/sleep 1))
+                          (swap! seen conj x))
+                        (range n))
+        (is (= (set (range n)) @seen) "every item observed")
+        (is (= n (.get calls)) "each item ran exactly once")))))
+
+(deftest parallel-doseq-propagates-worker-exception
+  (testing "a worker exception surfaces to the caller, not swallowed"
+    (when core-available?
+      (is (thrown? Throwable
+                   (parallel-doseq 4
+                                   (fn [x] (when (= x 50) (throw (ex-info "boom" {}))))
+                                   (range 100)))))))

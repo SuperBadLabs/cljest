@@ -121,6 +121,32 @@
       (is (= 5000 (:timeout config))))))
 
 ;; ---------------------------------------------------------------------------
+;; Coverage + coverage cache (PERF-007)
+;; ---------------------------------------------------------------------------
+
+(deftest coverage-defaults-on
+  (testing "coverage and coverage-cache default to true"
+    (let [config (cfg/resolve-config {} [])]
+      (is (= true (:coverage config)))
+      (is (= true (:coverage-cache config))))))
+
+(deftest cli-no-coverage
+  (testing "--no-coverage disables coverage-guided selection"
+    (let [config (cfg/resolve-config {} ["--no-coverage"])]
+      (is (= false (:coverage config))))))
+
+(deftest cli-no-coverage-cache
+  (testing "--no-coverage-cache disables the cross-run cache but leaves coverage on"
+    (let [config (cfg/resolve-config {} ["--no-coverage-cache"])]
+      (is (= false (:coverage-cache config)))
+      (is (= true (:coverage config))))))
+
+(deftest project-overrides-coverage-cache
+  (testing "project :cljest can disable the coverage cache"
+    (let [config (cfg/resolve-config {:cljest {:coverage-cache false}} [])]
+      (is (= false (:coverage-cache config))))))
+
+;; ---------------------------------------------------------------------------
 ;; Validation
 ;; ---------------------------------------------------------------------------
 

@@ -40,7 +40,8 @@ Every one of those is a gap to close *inside* cljest. This board does that.
 | CLJEST-PERF-005 | P1 | DONE | PERF-002 | **LPT / adaptive scheduling.** Dispatch namespaces longest-first (was alphabetical, so the slowest landed in the tail). Parallel pre-pass computes mutation count per ns; cost key prefers recorded `:elapsed-ms` from a prior run, else mutation count. Records elapsed per ns for adaptive runs. | ✅ Full repo: **LPT@16 = 33m09s beat alphabetical@24 = 36m27s** (fewer workers, no idle tail — held full 16-width through the bulk). Verdicts reproduced (46.8%). Evidence in Progress Log 2026-05-22. |
 | CLJEST-PERF-004 | P0 | DONE | PERF-002 | **Mutation-level parallelism within a namespace.** The schedulable unit is now a mutant-batch, not a namespace: large namespaces shard into batches (`--batch-size`, default 50) that all share one pool; a namespace checkpoints when its last batch lands. | ✅ Single namespace: identical verdicts, **4.05× sharding 8 batches**. Full repo: **33m09s → 21m05s** (concurrency held full ~17 min vs LPT@16's early decay), beats Docker baseline ~1.65×. Floor broken; remaining cost is redundant per-batch coverage → CLJEST-PERF-006. Evidence in Progress Log 2026-05-22. |
 | CLJEST-PERF-006 | P0 | ~~REJECTED~~ | PERF-004 | **Shared coverage across batches.** ~~Compute coverage once per namespace (write var→test map to a file) and have batches read it.~~ Built and validated in two forms; **neither beats PERF-004 — rejected.** v1 (two-wave, coverage for every sharded ns): **30m41s** @16 (net regression, over-sharded 106 coverage subprocesses + Wave-A→B barrier tail). v2 (heavies-only ≥4 batches + dynamic single-pool, no barrier): **28m18s** @16 — fixed v1's regression but still **+34s vs PERF-004's 27m44s** (a wash). **Root cause is architectural:** the makespan is bounded by the single slowest namespace (`web.saml`), and computing its coverage once *serializes a prefix before its batches can start*. PERF-004 pays coverage inline per batch (redundant CPU) but starts all batches at t=0, giving the bottleneck a *shorter* critical path. Shared coverage only saves redundant CPU on non-bottleneck batches, which are never on the critical path — so it cannot lower the wall on a makespan-bound-by-one-namespace workload. The real lever is the bottleneck's own critical path → PERF-003 (warm/pooled JVMs) or finer sharding of the mega-namespaces. v2 verdicts correct (46.5%, tree clean, 0 errors); code reverted, not shipped. | ❌ No win: 27m44s (PERF-004) → 28m18s (v2). See Progress Log 2026-05-22. |
-| CLJEST-PERF-003 | P1 | TODO | PERF-002 | **Warm worker JVMs.** Reuse pre-warmed project JVM(s) across namespaces instead of a cold `eval-in-project` per namespace; recycle on leak/wedge. | Per-namespace cold-start cost amortized; measured wall-clock reduction on the full sweep; wedge recovery still safe (halt + respawn). |
+| CLJEST-PERF-003 | P1 | DEFERRED | PERF-002 | **Warm worker JVMs.** Reuse pre-warmed project JVM(s) across namespaces instead of a cold subprocess per batch; recycle on leak/wedge. | ⏸️ **Deferred — probe shows a ~6% ceiling, not worth the complexity yet.** Measured per-batch fixed cost on the bottleneck (`web.saml`, fresh JVM): JVM boot ~2s + `require` 1.76s + private-/tmp mount ~0.5s = **~4.3s amortizable**, but the dominant fixed cost is the **~15.7s coverage suite run, which is NOT amortizable** (each of a heavy namespace's batches lands on a different idle worker, so each recomputes coverage — the same cross-batch wall PERF-006 hit). Warm JVMs would save ~4.3s × (≈395 units − 16 workers) ÷ 16 ≈ **~1.5–2 min wall (~6%)**, at the cost of a persistent-worker IPC protocol + work-stealing + wedge-detect/kill-9/respawn/re-enqueue. The coverage cost is the bigger lever → pursued via PERF-007 instead. Revisit once coverage is cheap. |
+| CLJEST-PERF-007 | P1 | DONE | PERF-001 | **Persistent coverage cache.** Cache the per-namespace coverage map (var → #{covering test-var symbols}) to disk and reuse it across runs, skipping the instrumented suite run (~15.7s/batch on `web.saml`). Keyed by a **whole-project source+test signature** — coverage is reachability-wide, so per-ns hashing is unsound on integration suites; any code change conservatively invalidates. Operator-independent (survives `--operators`/`--threshold`/`--resume`). Verdict-safe: hit ⇒ read map; miss ⇒ recompute; corrupt ⇒ full-suite fallback. | Cold run unchanged + populates cache; warm re-run of an unchanged checkout reuses coverage and drops the suite-run cost; verdicts identical, tree clean. Evidence in Progress Log 2026-05-22. |
 | CLJEST-ROB-001 | P1 | TODO | — | **Mutation-level streaming + resume.** Stream each result to disk as it completes (`runner.clj:127` writes once at the end); extend checkpoint to mutation granularity. | Kill mid-namespace, `--resume` re-runs only the unfinished mutants of that namespace, not the whole namespace. |
 | CLJEST-INC-001 | P1 | TODO | — | **Git-diff-aware incremental mode.** `--since REF` mutates only sites on lines changed vs a ref. | PR-scoped run mutates only changed code; documented; verdicts match a full run restricted to those sites. |
 | CLJEST-RPT-001 | P2 | TODO | — | **Survivor drill-down report.** HTML/text per surviving mutant: file, line, operator, original→mutated diff, and which tests ran; grouped by namespace/operator. | A reviewer can act on every survivor without rerunning; HTML diff view ships. |
@@ -185,3 +186,39 @@ EQV-001 (equivalents), RPT-002 (JSON+trend), DX-001 (GH Action), OPS-001
   start at t=0). v2 (heavies-only, no barrier) = 28m18s vs PERF-004 27m44s — a
   wash. The real lever is the bottleneck's own critical path → PERF-003 (warm
   JVMs) / finer sharding. PERF-004 remains the shipping state.
+- 2026-05-22: `CLJEST-PERF-003` DEFERRED (not built). Probe on the bottleneck
+  (`web.saml`, fresh JVM) measured the per-batch fixed cost warm JVMs would
+  amortize: JVM+clojure boot ~2s + `require` 1.76s + private-/tmp mount ~0.5s
+  ≈ **4.3s amortizable**, but the dominant fixed cost is the **~15.7s coverage
+  suite run, which is NOT amortizable** — each of a heavy namespace's batches
+  lands on a different idle worker, so each recomputes coverage (the same
+  cross-batch wall PERF-006 hit). Ceiling ≈ 4.3s × (≈395 units − 16 workers) ÷ 16
+  ≈ **~1.5–2 min (~6%)**, against a persistent-worker IPC + work-stealing +
+  wedge/respawn protocol. Not worth it yet; the coverage cost is the bigger
+  lever, pursued via PERF-007. Revisit once coverage is cheap.
+- 2026-05-22: `CLJEST-PERF-007` DONE. Per-namespace coverage maps are cached to
+  `<output-dir>/coverage-cache/<ns>.edn` and reused across runs, skipping the
+  instrumented suite run. Implementation: coverage now records covering test-var
+  **symbols** (serializable) and resolves them back with `requiring-resolve`
+  (`runner.clj`); the project JVM reads the cached map on a hit (no suite run) or
+  computes + atomically writes it on a miss; `checkpoint/project-coverage-signature`
+  keys the cache by a hash of **all** src+test file content (coverage is
+  reachability-wide, so per-ns hashing would be unsound on integration suites —
+  any code change conservatively invalidates), and is operator-independent so the
+  cache survives `--operators`/`--threshold`/`--resume`. `--no-coverage-cache`
+  disables it. Verdict-safe: hit ⇒ read; miss ⇒ recompute; corrupt/missing ⇒
+  full-suite fallback (never throws, never under-selects on a valid tree).
+  Validation (`chengis.web.mfa`, `--jobs 4`, cold→warm, unchanged tree):
+  - **verdicts identical**: 105 killed / 46 survived / 69.5% both passes.
+  - warm reused cache (`1/1 namespace(s)`, 4/4 batches logged `(cached)`), 0 errors.
+  - coverage reclaimed: aggregate work 1586.6s → 1504.1s (**−82.5s, ~5%**);
+    wall 434s → 416s. (Single small namespace at jobs=4 — the per-batch coverage
+    prefix is small; full-repo warm number measured separately.)
+  - 19 new unit tests pin the soundness contract (signature changes on any
+    src/test edit, invariant to operators/timeout/threshold; corrupt cache ⇒
+    invalid, not thrown) and the parallelism primitives (`make-work-units`
+    lossless sharding + batch-count bound; `parallel-doseq` runs-once + exception
+    propagation). Suite 149 → 168 tests, 0 failures.
+  Value beyond the ~5% wall: free coverage on unchanged checkouts (CI retries,
+  `--operators` preset switches, `--resume`), and the cache foundation INC-001
+  builds on for sound per-namespace incremental invalidation.
