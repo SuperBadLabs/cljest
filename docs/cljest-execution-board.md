@@ -38,7 +38,8 @@ Every one of those is a gap to close *inside* cljest. This board does that.
 | CLJEST-PERF-002 | P0 | DONE | ISO-001 | **Native parallel execution.** `--jobs N` worker pool launches each namespace as an independent raw `java` subprocess (classpath/prep resolved once, not per call). Removes the need for external Docker sharding for source isolation. | ✅ **6.54× at 8 jobs** (near-linear, 82% eff.) on independent workloads; verdicts unchanged; tree clean. Speedup is bounded by a project's own shared test state — see CLJEST-ISO-002. Evidence in Progress Log 2026-05-21. |
 | CLJEST-ISO-002 | P1 | DONE | PERF-002 | **Per-worker private `/tmp`.** Each worker subprocess runs in its own mount namespace with a fresh dir bind-mounted over `/tmp` (so even hardcoded `/tmp/foo.db` literals are isolated), dropping back to the invoking user via `setpriv`. `--private-tmp auto\|off\|unshare\|sudo`. | ✅ Removes cross-worker `/tmp` contention: chengis jobs=8 went from serialized (workers pinned ~1) to a genuine 8→1 parallel burst; 289s→199s; verdicts correct, tree clean, ran as uid 1000. Residual long-tail (one slow ns) → CLJEST-PERF-004. Evidence in Progress Log 2026-05-22. |
 | CLJEST-PERF-005 | P1 | DONE | PERF-002 | **LPT / adaptive scheduling.** Dispatch namespaces longest-first (was alphabetical, so the slowest landed in the tail). Parallel pre-pass computes mutation count per ns; cost key prefers recorded `:elapsed-ms` from a prior run, else mutation count. Records elapsed per ns for adaptive runs. | ✅ Full repo: **LPT@16 = 33m09s beat alphabetical@24 = 36m27s** (fewer workers, no idle tail — held full 16-width through the bulk). Verdicts reproduced (46.8%). Evidence in Progress Log 2026-05-22. |
-| CLJEST-PERF-004 | P0 | TODO | PERF-002 | **Mutation-level parallelism within a namespace.** Even with LPT, the makespan is floored by ONE namespace: in LPT@16, ~4 auth namespaces ran 23–33 min each (`web.saml` 33 min) while ~12 workers sat idle in the tail. Shard a single namespace's mutants across idle workers. | A single large namespace's mutants run across N workers; the slowest-namespace floor drops toward total-work/N. |
+| CLJEST-PERF-004 | P0 | DONE | PERF-002 | **Mutation-level parallelism within a namespace.** The schedulable unit is now a mutant-batch, not a namespace: large namespaces shard into batches (`--batch-size`, default 50) that all share one pool; a namespace checkpoints when its last batch lands. | ✅ Single namespace: identical verdicts, **4.05× sharding 8 batches**. Full repo: **33m09s → 21m05s** (concurrency held full ~17 min vs LPT@16's early decay), beats Docker baseline ~1.65×. Floor broken; remaining cost is redundant per-batch coverage → CLJEST-PERF-006. Evidence in Progress Log 2026-05-22. |
+| CLJEST-PERF-006 | P0 | TODO | PERF-004 | **Shared coverage across batches.** Each mutant-batch re-runs its namespace's full suite to rebuild the coverage map (observed: `web.saml` 7 batches × ~390s, dominated by coverage recompute, not mutants). Compute coverage once per namespace (write var→test map to a file) and have batches read it. | A sharded namespace computes coverage once; batch time is dominated by mutants, not coverage; full sweep drops toward ~total-mutant-work/N. |
 | CLJEST-PERF-003 | P1 | TODO | PERF-002 | **Warm worker JVMs.** Reuse pre-warmed project JVM(s) across namespaces instead of a cold `eval-in-project` per namespace; recycle on leak/wedge. | Per-namespace cold-start cost amortized; measured wall-clock reduction on the full sweep; wedge recovery still safe (halt + respawn). |
 | CLJEST-ROB-001 | P1 | TODO | — | **Mutation-level streaming + resume.** Stream each result to disk as it completes (`runner.clj:127` writes once at the end); extend checkpoint to mutation granularity. | Kill mid-namespace, `--resume` re-runs only the unfinished mutants of that namespace, not the whole namespace. |
 | CLJEST-INC-001 | P1 | TODO | — | **Git-diff-aware incremental mode.** `--since REF` mutates only sites on lines changed vs a ref. | PR-scoped run mutates only changed code; documented; verdicts match a full run restricted to those sites. |
@@ -159,3 +160,21 @@ EQV-001 (equivalents), RPT-002 (JSON+trend), DX-001 (GH Action), OPS-001
   (now P0) is required to break the floor. Adaptive timing now recorded, so the
   next run ranks these by real cost (mutation count alone under-ranked
   `web.mfa`, only 151 mutants).
+- 2026-05-22: `CLJEST-PERF-004` DONE. The schedulable unit is now a
+  mutant-batch, not a whole namespace. A namespace with more than `--batch-size`
+  (default 50) mutants is split into `min(jobs, ceil(n/batch-size))` batches;
+  all units (small-namespace wholes + large-namespace batches) go into one pool
+  longest-first, and a namespace is checkpointed once its last batch lands
+  (`ns-acc` countdown). `run-mutations-for-namespace` already runs an arbitrary
+  mutant subset, so batches reuse it unchanged. Validation:
+  - Single namespace, `--jobs 8`: 1 unit 18.6s vs 8 batches 4.6s = **4.05×**,
+    identical verdicts (11 killed/5 survived).
+  - Full repo (`--jobs 24 --private-tmp sudo`, fresh): **LPT@16 33m09s →
+    21m05s**; concurrency held full (~25) for ~17 min then a ~2.5-min tail
+    (vs LPT@16's long decay) — the single-namespace floor is gone. Beats the
+    original Docker baseline (~35 min) by ~1.65×. Score 46.5% (≈ baseline);
+    tree clean; 0 errors; 395 work units.
+  Finding: per-batch wall is now dominated by REDUNDANT COVERAGE — each batch
+  re-runs its namespace's full suite to rebuild the var→test map (`web.saml`
+  7 batches × ~390s, mostly coverage). Compute coverage once per namespace and
+  share it across batches → CLJEST-PERF-006 (next ~1.4×).

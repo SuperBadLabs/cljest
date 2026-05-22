@@ -22,6 +22,7 @@
    :skip-equivalent true      ; filter trivially equivalent mutations
    :coverage true             ; coverage-guided test selection (only run covering tests)
    :jobs 1                    ; number of namespaces to mutate in parallel
+   :batch-size 50             ; shard a namespace into mutant batches above this size
    :private-tmp :auto         ; per-worker private /tmp: :auto | :off | :unshare | :sudo
    :dry-run false
    :verbose false
@@ -49,6 +50,9 @@
     :parse-fn #(Long/parseLong %)
     :validate [pos? "Must be positive"]]
    [nil "--jobs N" "Number of namespaces to mutate in parallel (default: 1)"
+    :parse-fn #(Integer/parseInt %)
+    :validate [pos? "Must be positive"]]
+   [nil "--batch-size N" "Shard a namespace into mutant batches above this size (default: 50)"
     :parse-fn #(Integer/parseInt %)
     :validate [pos? "Must be positive"]]
    [nil "--private-tmp MODE" "Per-worker private /tmp: auto, off, unshare, sudo (default: auto)"

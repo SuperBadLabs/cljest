@@ -98,6 +98,7 @@ Add a `:cljest` key to your `project.clj`:
   --dry-run                   Show mutation count without running
   --no-coverage               Disable coverage-guided test selection
   --jobs N                    Mutate N namespaces in parallel [default: 1]
+  --batch-size N              Shard a namespace into mutant batches above N [default: 50]
   --private-tmp MODE          Per-worker private /tmp: auto|off|unshare|sudo [default: auto]
   --verbose                   Verbose output
   --help                      Show help
@@ -111,6 +112,13 @@ so there's no shared in-process state between workers — mutants are applied
 in-memory (so the source tree is read-only and safe to share) and each worker
 gets its own `java.io.tmpdir`. On independent workloads this scales near-linearly
 (~6.5× at `--jobs 8`).
+
+The schedulable unit is a *mutant-batch*, not a whole namespace: a namespace
+with more than `--batch-size` mutants (default 50) is sharded into batches that
+all draw from the same pool, so a single slow namespace can use many workers
+instead of bounding the wall clock. Work is dispatched longest-first, preferring
+a recorded per-namespace wall time from a prior run (persisted in the checkpoint)
+and falling back to mutation count.
 
 If your **tests** hardcode an absolute scratch path like `/tmp/app.db` rather
 than deriving it from `java.io.tmpdir`, concurrent workers would otherwise
