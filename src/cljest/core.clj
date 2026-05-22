@@ -135,13 +135,11 @@
                                            "no — workers share host /tmp"))))
                     ctx))
                 process-target
-                (fn [{:keys [source-ns source-file test-namespaces] :as target}]
-                  (let [sites (mutator/find-mutation-sites source-file operator-ids)
-                        mutations (mutator/expand-mutations sites)
-                        mutation-count (count mutations)]
+                (fn [{:keys [source-ns source-file test-namespaces sites-count mutations] :as target}]
+                  (let [mutation-count (count mutations)]
                     (swap! total-mutations + mutation-count)
                     (log! (format "  Scanning %s ... %d site(s), %d mutation(s)"
-                                  source-ns (count sites) mutation-count))
+                                  source-ns sites-count mutation-count))
 
                     (when (and (seq mutations) (not dry-run?))
                       (let [sig (checkpoint/signature target config)
@@ -155,10 +153,13 @@
                                           source-ns killed survived))
                             (swap! resumed-count inc)
                             (swap! all-results into cached))
-                          ;; Run fresh, then checkpoint the results
-                          (let [ns-results (runner/run-mutations-for-namespace
+                          ;; Run fresh, then checkpoint the results (timing the
+                          ;; run so LPT scheduling can use it next time).
+                          (let [t0 (System/nanoTime)
+                                ns-results (runner/run-mutations-for-namespace
                                              launch-ctx source-ns source-file
                                              test-namespaces mutations config)
+                                elapsed-ms (quot (- (System/nanoTime) t0) 1000000)
                                 ;; Tag results with source info
                                 tagged (mapv #(assoc %
                                                      :source-ns source-ns
@@ -166,15 +167,34 @@
                                              ns-results)
                                 killed (count (filter #(#{:killed :timed-out} (:status %)) tagged))
                                 survived (count (filter #(= :survived (:status %)) tagged))]
-                            (log! (format "    → %s: %d killed, %d survived"
-                                          source-ns killed survived))
-                            (checkpoint/save-results! checkpoint-dir source-ns sig tagged)
+                            (log! (format "    → %s: %d killed, %d survived (%.1fs)"
+                                          source-ns killed survived (/ elapsed-ms 1000.0)))
+                            (checkpoint/save-results! checkpoint-dir source-ns sig tagged elapsed-ms)
                             (swap! fresh-count inc)
                             (swap! all-results into tagged)))))))]
 
-            (when (> jobs 1)
-              (main/info (format "  Running with %d parallel job(s)" jobs)))
-            (parallel-doseq jobs process-target targets)
+            ;; LPT scheduling: compute each namespace's mutation sites once (in
+            ;; parallel — pure parsing), then dispatch longest-first so a slow
+            ;; namespace starts at t=0 and the rest backfill, instead of the
+            ;; slowest ones landing in the tail. Cost key prefers a recorded
+            ;; wall time from a prior run, falling back to mutation count.
+            (let [targets+ (->> targets
+                                (pmap (fn [t]
+                                        (let [sites (mutator/find-mutation-sites
+                                                      (:source-file t) operator-ids)
+                                              muts (vec (mutator/expand-mutations sites))]
+                                          (assoc t
+                                                 :sites-count (count sites)
+                                                 :mutations muts
+                                                 :cost (or (checkpoint/load-elapsed
+                                                             checkpoint-dir (:source-ns t))
+                                                           (* (count muts) 200))))))
+                                (sort-by :cost >)
+                                vec)]
+              (when (> jobs 1)
+                (main/info (format "  Running with %d parallel job(s), longest-first scheduling"
+                                   jobs)))
+              (parallel-doseq jobs process-target targets+))
 
             (when (and (not dry-run?) (or (pos? @resumed-count) resume?))
               (main/info)
