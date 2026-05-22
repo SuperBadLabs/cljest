@@ -40,10 +40,31 @@ lein cljest --format html
 
 1. **Discover** source and test namespaces from your project
 2. **Scan** source code for mutation sites using rewrite-clj
-3. **For each mutation**: overwrite the source file, reload the namespace, run matched tests
-4. **Record** whether tests caught the mutation (killed) or missed it (survived)
-5. **Restore** the original source (guaranteed via `finally` block)
-6. **Report** mutation score with details on surviving mutations
+3. **Capture coverage** (once): run the matched suite with the source namespace
+   instrumented to learn which tests exercise which function
+4. **For each mutation**: overwrite the source file, reload the namespace, and
+   run only the tests that cover the mutated function (see *Coverage-Guided
+   Selection* below)
+5. **Record** whether tests caught the mutation (killed) or missed it (survived)
+6. **Restore** the original source (guaranteed via `finally` block)
+7. **Report** mutation score with details on surviving mutations
+
+## Coverage-Guided Selection
+
+Mutation testing's dominant cost is re-running tests once per mutant — and most
+of those runs are wasted, since a mutant inside `foo` can only be killed by a
+test that exercises `foo`. cljest captures per-function coverage once (attributing
+each source-var call to the running test), then runs only the covering tests for
+each mutant.
+
+A mutant whose enclosing function has *no* recorded coverage (uncovered code, a
+non-fn `def`, a multimethod, or an unresolved position) falls back to running the
+**full** test set — so selection only ever *shrinks* the run when there is
+positive coverage evidence, and never changes a kill/survive verdict.
+
+This is on by default. Disable it with `--no-coverage` (or `:coverage false`) to
+run every matched test for every mutant. Typical speedups range from ~1× on
+fast/tiny suites (no test time to reclaim) to several× on slow, broad suites.
 
 ## Configuration
 
@@ -57,7 +78,8 @@ Add a `:cljest` key to your `project.clj`:
          :timeout 30000                     ; per-mutation timeout (ms)
          :output-dir "target/cljest"
          :output-format [:text :html]
-         :skip-equivalent true}
+         :skip-equivalent true
+         :coverage true}                    ; coverage-guided test selection
 ```
 
 ## CLI Options
@@ -71,6 +93,7 @@ Add a `:cljest` key to your `project.clj`:
   --timeout MS                Per-mutation timeout (ms) [default: 30000]
   --output-dir DIR            Report output directory [default: target/cljest]
   --dry-run                   Show mutation count without running
+  --no-coverage               Disable coverage-guided test selection
   --verbose                   Verbose output
   --help                      Show help
 ```

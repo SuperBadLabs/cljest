@@ -20,6 +20,7 @@
    :output-dir "target/cljest"
    :output-format [:text]
    :skip-equivalent true      ; filter trivially equivalent mutations
+   :coverage true             ; coverage-guided test selection (only run covering tests)
    :dry-run false
    :verbose false
    :resume false              ; reuse valid checkpoint entries, skip re-running
@@ -47,6 +48,8 @@
     :validate [pos? "Must be positive"]]
    [nil "--output-dir DIR" "Report output directory"]
    [nil "--dry-run" "Show mutation count without running"]
+   [nil "--no-coverage" "Disable coverage-guided test selection (run all matched tests per mutant)"
+    :id :coverage :update-fn (constantly false)]
    [nil "--resume" "Resume from checkpoint: skip namespaces already completed with unchanged source/tests"]
    [nil "--checkpoint-dir DIR" "Directory for per-namespace checkpoint files (default: <output-dir>/checkpoint)"]
    [nil "--clear-checkpoint" "Delete existing checkpoint entries before running"]
