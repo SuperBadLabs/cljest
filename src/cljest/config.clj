@@ -22,6 +22,7 @@
    :skip-equivalent true      ; filter trivially equivalent mutations
    :coverage true             ; coverage-guided test selection (only run covering tests)
    :jobs 1                    ; number of namespaces to mutate in parallel
+   :private-tmp :auto         ; per-worker private /tmp: :auto | :off | :unshare | :sudo
    :dry-run false
    :verbose false
    :resume false              ; reuse valid checkpoint entries, skip re-running
@@ -50,6 +51,9 @@
    [nil "--jobs N" "Number of namespaces to mutate in parallel (default: 1)"
     :parse-fn #(Integer/parseInt %)
     :validate [pos? "Must be positive"]]
+   [nil "--private-tmp MODE" "Per-worker private /tmp: auto, off, unshare, sudo (default: auto)"
+    :parse-fn keyword
+    :validate [#{:auto :off :unshare :sudo} "Must be auto, off, unshare, or sudo"]]
    [nil "--output-dir DIR" "Report output directory"]
    [nil "--dry-run" "Show mutation count without running"]
    [nil "--no-coverage" "Disable coverage-guided test selection (run all matched tests per mutant)"

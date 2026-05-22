@@ -98,6 +98,7 @@ Add a `:cljest` key to your `project.clj`:
   --dry-run                   Show mutation count without running
   --no-coverage               Disable coverage-guided test selection
   --jobs N                    Mutate N namespaces in parallel [default: 1]
+  --private-tmp MODE          Per-worker private /tmp: auto|off|unshare|sudo [default: auto]
   --verbose                   Verbose output
   --help                      Show help
 ```
@@ -111,11 +112,25 @@ in-memory (so the source tree is read-only and safe to share) and each worker
 gets its own `java.io.tmpdir`. On independent workloads this scales near-linearly
 (~6.5× at `--jobs 8`).
 
-Caveat: if your **tests** share mutable state across namespaces — e.g. they
-hardcode an absolute path like `/tmp/app.db` rather than deriving it from
-`java.io.tmpdir` — concurrent workers will contend on that shared resource and
-parallelism won't help (and may hurt). Prefer per-test temp paths derived from
-`java.io.tmpdir`, or run shards in separate containers with a private `/tmp`.
+If your **tests** hardcode an absolute scratch path like `/tmp/app.db` rather
+than deriving it from `java.io.tmpdir`, concurrent workers would otherwise
+contend on that shared file. `--private-tmp` gives each worker its own `/tmp`
+so even hardcoded `/tmp/...` paths are isolated:
+
+- `auto` (default) — use an unprivileged mount namespace if the host allows it
+  (unprivileged user namespaces), otherwise run without private `/tmp`. Never
+  escalates privileges silently.
+- `sudo` — create the per-worker mount namespace via `sudo`, then drop back to
+  the invoking user with `setpriv` so tests don't run as root. Needs passwordless
+  `sudo` for `unshare`. Use this on hosts where unprivileged user namespaces are
+  disabled (e.g. Ubuntu 23.10+ with the AppArmor restriction).
+- `unshare` — force the unprivileged mount-namespace path.
+- `off` — share the host `/tmp`.
+
+Each worker gets a fresh private `/tmp` per namespace, cleaned up afterward.
+Note that `--private-tmp` removes cross-worker `/tmp` contention but cannot fix
+imbalance between namespaces — a single slow namespace still bounds the wall
+clock (mutation-level parallelism is tracked separately).
 
 ## Mutation Operators
 

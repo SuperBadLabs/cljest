@@ -126,7 +126,14 @@
                 (when-not dry-run?
                   (when (> jobs 1)
                     (main/info "  Compiling project once for parallel workers ..."))
-                  (runner/prepare-launch-context project))
+                  (let [ctx (runner/prepare-launch-context project (:private-tmp config))]
+                    (when (> jobs 1)
+                      (main/info (format "  Private /tmp per worker: %s"
+                                         (case (:private-tmp ctx)
+                                           :unshare "yes (unprivileged mount namespace)"
+                                           :sudo "yes (sudo mount namespace)"
+                                           "no — workers share host /tmp"))))
+                    ctx))
                 process-target
                 (fn [{:keys [source-ns source-file test-namespaces] :as target}]
                   (let [sites (mutator/find-mutation-sites source-file operator-ids)

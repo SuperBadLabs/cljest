@@ -222,20 +222,51 @@
 ;; Execution
 ;; ---------------------------------------------------------------------------
 
-(defn- make-results-file
-  "Generate a unique temp file path for results (safe under parallel jobs)."
-  []
-  (str (System/getProperty "java.io.tmpdir")
-       "/cljest-results-" (System/nanoTime) "-" (java.util.UUID/randomUUID) ".edn"))
+;; ---------------------------------------------------------------------------
+;; Per-worker private /tmp (CLJEST-ISO-002)
+;;
+;; Parallel workers that share the host /tmp serialize whenever a project's
+;; tests hardcode an absolute scratch path (e.g. /tmp/app.db) and lock it.
+;; Per-slot java.io.tmpdir can't redirect a hardcoded /tmp literal. The only
+;; way to give each worker its own /tmp is a private mount namespace that
+;; bind-mounts a per-worker dir over /tmp. We support two mechanisms:
+;;   :unshare — unprivileged user+mount namespace (needs unprivileged userns;
+;;              blocked by AppArmor on Ubuntu 23.10+ by default)
+;;   :sudo    — sudo mount namespace, dropping back to the invoking user with
+;;              setpriv so tests don't run as root (needs passwordless sudo)
+;; ---------------------------------------------------------------------------
 
-(defn- worker-slot
-  "Derive this worker's slot id from its thread name (cljest-worker-N), or
-   \"0\" when running on the calling thread (sequential mode)."
-  []
-  (let [n (.getName (Thread/currentThread))]
-    (if-let [m (re-find #"cljest-worker-(\d+)" n)]
-      (second m)
-      "0")))
+(defn- sh-silent?
+  "Run a command, discarding output; return true iff it exits 0."
+  [& args]
+  (try
+    (zero? (.waitFor (.start (doto (ProcessBuilder. ^java.util.List (vec args))
+                               (.redirectOutput java.lang.ProcessBuilder$Redirect/DISCARD)
+                               (.redirectError java.lang.ProcessBuilder$Redirect/DISCARD)))))
+    (catch Throwable _ false)))
+
+(defn- sh-out
+  "Run a command and return trimmed stdout, or nil on failure."
+  [& args]
+  (try
+    (let [p (.start (doto (ProcessBuilder. ^java.util.List (vec args))
+                      (.redirectError java.lang.ProcessBuilder$Redirect/DISCARD)))
+          out (slurp (.getInputStream p))]
+      (.waitFor p)
+      (str/trim out))
+    (catch Throwable _ nil)))
+
+(defn resolve-private-tmp
+  "Resolve the requested private-/tmp mode to an effective mechanism keyword
+   (:unshare | :sudo | :off), probing the host's capabilities. :auto prefers
+   unprivileged userns and never silently escalates to sudo."
+  [mode]
+  (case (keyword (or mode :auto))
+    :off :off
+    :unshare (if (sh-silent? "unshare" "--mount" "--map-root-user" "true") :unshare :off)
+    :sudo (if (sh-silent? "sudo" "-n" "unshare" "--mount" "true") :sudo :off)
+    ;; :auto
+    (if (sh-silent? "unshare" "--mount" "--map-root-user" "true") :unshare :off)))
 
 (defn prepare-launch-context
   "Compile the project and resolve the classpath + JVM args ONCE, so each
@@ -247,38 +278,74 @@
    with --jobs 8. Doing that work once and launching bare subprocesses removes
    the shared parent bottleneck entirely.
 
-   Returns {:classpath <cp string> :jvm-args [..] :target-path <dir>}."
-  [project]
+   `private-tmp-mode` is :auto|:off|:unshare|:sudo (see resolve-private-tmp).
+
+   Returns {:classpath :jvm-args :target-path :private-tmp :uid :gid}."
+  [project private-tmp-mode]
   (eval/prep project)
   (let [jvm-args (if-let [f (resolve 'leiningen.core.eval/get-jvm-args)]
                    (vec (f project))
-                   (vec (:jvm-opts project)))]
+                   (vec (:jvm-opts project)))
+        mech (resolve-private-tmp private-tmp-mode)]
     {:classpath (str/join java.io.File/pathSeparator (lcp/get-classpath project))
      :jvm-args jvm-args
-     :target-path (or (:target-path project) "target")}))
+     :target-path (or (:target-path project) "target")
+     :private-tmp mech
+     :uid (or (sh-out "id" "-u") "1000")
+     :gid (or (sh-out "id" "-g") "1000")}))
+
+(defn- private-tmp-prefix
+  "Return the command prefix that runs `_inner-cmd_` (appended by the caller)
+   inside a mount namespace with `tmp-dir` bind-mounted over /tmp, or nil for
+   :off. The trailing positional args ($1 = tmp-dir, $2.. = the java command)
+   are bound after the prefix."
+  [mech tmp-dir uid gid]
+  (case mech
+    :unshare ["unshare" "--mount" "--map-root-user" "--propagation" "private"
+              "/bin/sh" "-c" "mount --bind \"$1\" /tmp; shift; exec \"$@\""
+              "cljest" tmp-dir]
+    :sudo ["sudo" "-n" "unshare" "--mount" "--propagation" "private"
+           "/bin/sh" "-c"
+           (str "mount --bind \"$1\" /tmp; shift; "
+                "exec setpriv --reuid=" uid " --regid=" gid " --init-groups \"$@\"")
+           "cljest" tmp-dir]
+    nil))
+
+(defn- delete-tree!
+  [^java.io.File f]
+  (when (.isDirectory f)
+    (run! delete-tree! (.listFiles f)))
+  (.delete f))
 
 (defn- run-subprocess!
   "Launch `form` in a fresh JVM via clojure.main using the precomputed
-   classpath/JVM args, with a per-worker java.io.tmpdir. Blocks until the
-   process exits (the form writes its results file and halts). Returns the
-   exit code."
-  [launch-ctx slot form]
-  (let [tmp (str (:target-path launch-ctx) "/cljest-par/slot-" slot "/tmp")
-        _ (.mkdirs (io/file tmp))
-        form-file (java.io.File/createTempFile "cljest-form-" ".clj")
-        cmd (-> ["java"]
-                (into (:jvm-args launch-ctx))
-                (conj (str "-Djava.io.tmpdir=" tmp))
-                (into ["-cp" (:classpath launch-ctx)
-                       "clojure.main" (.getAbsolutePath form-file)]))]
+   classpath/JVM args. `worktmp` is this launch's scratch dir, used as
+   java.io.tmpdir and, when a private-/tmp mechanism is active, bind-mounted
+   over /tmp inside a per-worker mount namespace so even hardcoded /tmp paths
+   are isolated.
+
+   IMPORTANT: the form file (and the results file the form writes) live UNDER
+   worktmp and are referenced by absolute path. worktmp sits under the project
+   target dir, not /tmp, so those paths resolve identically inside and outside
+   the mount namespace — otherwise the bind-over-/tmp would hide the results
+   from the parent. Blocks until the process exits; returns the exit code."
+  [launch-ctx ^java.io.File worktmp form]
+  (let [tmp (.getAbsolutePath worktmp)
+        form-file (io/file worktmp "form.clj")
+        java-cmd (-> ["java"]
+                     (into (:jvm-args launch-ctx))
+                     (conj (str "-Djava.io.tmpdir=" tmp))
+                     (into ["-cp" (:classpath launch-ctx)
+                            "clojure.main" (.getAbsolutePath form-file)]))
+        cmd (if-let [pre (private-tmp-prefix (:private-tmp launch-ctx) tmp
+                                             (:uid launch-ctx) (:gid launch-ctx))]
+              (into (vec pre) java-cmd)
+              java-cmd)]
     (spit form-file (pr-str form))
-    (try
-      (let [pb (doto (ProcessBuilder. ^java.util.List cmd)
-                 (.redirectOutput java.lang.ProcessBuilder$Redirect/DISCARD)
-                 (.redirectError java.lang.ProcessBuilder$Redirect/INHERIT))]
-        (.waitFor (.start pb)))
-      (finally
-        (.delete form-file)))))
+    (let [pb (doto (ProcessBuilder. ^java.util.List cmd)
+               (.redirectOutput java.lang.ProcessBuilder$Redirect/DISCARD)
+               (.redirectError java.lang.ProcessBuilder$Redirect/INHERIT))]
+      (.waitFor (.start pb)))))
 
 (defn run-mutations-for-namespace
   "Run all mutations for a source namespace.
@@ -299,7 +366,12 @@
 
    Returns a vec of result maps with :status :killed/:survived/:timed-out/:error."
   [launch-ctx src-ns src-file test-nses mutations config]
-  (let [results-file (make-results-file)
+  (let [worktmp (io/file (:target-path launch-ctx) "cljest-par"
+                         (str (java.util.UUID/randomUUID)))
+        _ (.mkdirs worktmp)
+        ;; Results live under worktmp (not /tmp) so the path resolves the same
+        ;; inside a private-/tmp mount namespace as it does for this parent.
+        results-file (.getAbsolutePath (io/file worktmp "results.edn"))
         timeout-ms (:timeout config 30000)
         verbose? (:verbose config)
         coverage? (:coverage config true)
@@ -328,6 +400,7 @@
       (do
         (when verbose?
           (main/info "  No valid mutations for" (str src-ns)))
+        (delete-tree! worktmp)
         [])
 
       ;; Build the form (self-initializing: it requires clojure.test, the test
@@ -338,15 +411,15 @@
         ;; Launch as an independent subprocess — no shared Leiningen machinery,
         ;; so parallel workers actually run concurrently.
         (try
-          (run-subprocess! launch-ctx (worker-slot) form)
+          (run-subprocess! launch-ctx worktmp form)
           ;; Read results
           (let [results-raw (slurp results-file)
                 results (edn/read-string results-raw)]
-            (io/delete-file results-file true)
             (vec results))
           (catch Exception e
             (main/warn "Error running mutations for" (str src-ns) "-" (.getMessage e))
-            (io/delete-file results-file true)
             ;; Return all mutations as errors
             (mapv #(assoc % :status :error :error (.getMessage e))
-                  valid-mutations)))))))
+                  valid-mutations))
+          (finally
+            (delete-tree! worktmp)))))))
