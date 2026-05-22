@@ -21,6 +21,36 @@
   (when verbose?
     (apply main/info args)))
 
+(defn- parallel-doseq
+  "Apply f to each item of coll, blocking until all complete.
+
+   With jobs<=1, runs sequentially on the calling thread. With jobs>1, runs on
+   a fixed pool of `jobs` daemon threads named `cljest-worker-<slot>` — the
+   runner derives a per-worker target/tmp isolation directory from that slot so
+   concurrent project JVMs never share a compile-path or temp dir. Each
+   namespace already runs in its own subprocess JVM (process isolation) and
+   mutants are applied in-memory (CLJEST-ISO-001), so the working source tree is
+   read-only and safe to share across workers. The first worker exception is
+   rethrown after the pool is shut down."
+  [jobs f coll]
+  (if (<= jobs 1)
+    (doseq [x coll] (f x))
+    (let [factory (let [i (atom -1)]
+                    (reify java.util.concurrent.ThreadFactory
+                      (newThread [_ r]
+                        (doto (Thread. r (str "cljest-worker-" (swap! i inc)))
+                          (.setDaemon true)))))
+          pool (java.util.concurrent.Executors/newFixedThreadPool (int jobs) factory)]
+      (try
+        (let [futures (mapv (fn [x]
+                              (.submit pool ^java.util.concurrent.Callable
+                                       (fn [] (f x))))
+                            coll)]
+          (doseq [^java.util.concurrent.Future fut futures]
+            (.get fut)))
+        (finally
+          (.shutdown pool))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Main pipeline
 ;; ---------------------------------------------------------------------------
@@ -38,6 +68,7 @@
         dry-run? (:dry-run config)
         resume? (:resume config)
         checkpoint-dir (:checkpoint-dir config)
+        jobs (max 1 (long (:jobs config 1)))
         operator-ids (ops/resolve-preset (:operators config))
         start-time (System/nanoTime)]
 
@@ -84,46 +115,59 @@
           (let [all-results (atom [])
                 total-mutations (atom 0)
                 resumed-count (atom 0)
-                fresh-count (atom 0)]
-            (doseq [{:keys [source-ns source-file test-namespaces] :as target} targets]
-              (main/info (format "  Scanning %s ..." source-ns))
-              (let [sites (mutator/find-mutation-sites source-file operator-ids)
-                    mutations (mutator/expand-mutations sites)
-                    mutation-count (count mutations)]
-                (swap! total-mutations + mutation-count)
-                (main/info (format "    %d mutation site(s), %d mutation(s)"
-                                   (count sites) mutation-count))
+                fresh-count (atom 0)
+                print-lock (Object.)
+                log! (fn [& args] (locking print-lock (apply main/info args)))
+                ;; Compile the project and resolve the classpath ONCE; each
+                ;; namespace then launches as an independent raw subprocess
+                ;; (see runner/prepare-launch-context). This avoids Leiningen's
+                ;; per-call prep, which serializes and races parallel workers.
+                launch-ctx
+                (when-not dry-run?
+                  (when (> jobs 1)
+                    (main/info "  Compiling project once for parallel workers ..."))
+                  (runner/prepare-launch-context project))
+                process-target
+                (fn [{:keys [source-ns source-file test-namespaces] :as target}]
+                  (let [sites (mutator/find-mutation-sites source-file operator-ids)
+                        mutations (mutator/expand-mutations sites)
+                        mutation-count (count mutations)]
+                    (swap! total-mutations + mutation-count)
+                    (log! (format "  Scanning %s ... %d site(s), %d mutation(s)"
+                                  source-ns (count sites) mutation-count))
 
-                (when (and (seq mutations) (not dry-run?))
-                  (let [sig (checkpoint/signature target config)
-                        cached (when resume?
-                                 (checkpoint/load-results checkpoint-dir source-ns sig))]
-                    (if cached
-                      ;; Resume: reuse checkpointed results, skip the JVM launch
-                      (let [killed (count (filter #(#{:killed :timed-out} (:status %)) cached))
-                            survived (count (filter #(= :survived (:status %)) cached))]
-                        (main/info (format "    ↺ resumed from checkpoint: %d killed, %d survived"
-                                           killed survived))
-                        (swap! resumed-count inc)
-                        (swap! all-results into cached))
-                      ;; Run fresh, then checkpoint the results
-                      (do
-                        (main/info (format "    Running mutations for %s ..." source-ns))
-                        (let [ns-results (runner/run-mutations-for-namespace
-                                           project source-ns source-file
-                                           test-namespaces mutations config)
-                              ;; Tag results with source info
-                              tagged (mapv #(assoc %
-                                                   :source-ns source-ns
-                                                   :source-file source-file)
-                                           ns-results)
-                              killed (count (filter #(#{:killed :timed-out} (:status %)) tagged))
-                              survived (count (filter #(= :survived (:status %)) tagged))]
-                          (main/info (format "    → %d killed, %d survived"
-                                             killed survived))
-                          (checkpoint/save-results! checkpoint-dir source-ns sig tagged)
-                          (swap! fresh-count inc)
-                          (swap! all-results into tagged))))))))
+                    (when (and (seq mutations) (not dry-run?))
+                      (let [sig (checkpoint/signature target config)
+                            cached (when resume?
+                                     (checkpoint/load-results checkpoint-dir source-ns sig))]
+                        (if cached
+                          ;; Resume: reuse checkpointed results, skip the JVM launch
+                          (let [killed (count (filter #(#{:killed :timed-out} (:status %)) cached))
+                                survived (count (filter #(= :survived (:status %)) cached))]
+                            (log! (format "    ↺ %s resumed from checkpoint: %d killed, %d survived"
+                                          source-ns killed survived))
+                            (swap! resumed-count inc)
+                            (swap! all-results into cached))
+                          ;; Run fresh, then checkpoint the results
+                          (let [ns-results (runner/run-mutations-for-namespace
+                                             launch-ctx source-ns source-file
+                                             test-namespaces mutations config)
+                                ;; Tag results with source info
+                                tagged (mapv #(assoc %
+                                                     :source-ns source-ns
+                                                     :source-file source-file)
+                                             ns-results)
+                                killed (count (filter #(#{:killed :timed-out} (:status %)) tagged))
+                                survived (count (filter #(= :survived (:status %)) tagged))]
+                            (log! (format "    → %s: %d killed, %d survived"
+                                          source-ns killed survived))
+                            (checkpoint/save-results! checkpoint-dir source-ns sig tagged)
+                            (swap! fresh-count inc)
+                            (swap! all-results into tagged)))))))]
+
+            (when (> jobs 1)
+              (main/info (format "  Running with %d parallel job(s)" jobs)))
+            (parallel-doseq jobs process-target targets)
 
             (when (and (not dry-run?) (or (pos? @resumed-count) resume?))
               (main/info)

@@ -21,6 +21,7 @@
    :output-format [:text]
    :skip-equivalent true      ; filter trivially equivalent mutations
    :coverage true             ; coverage-guided test selection (only run covering tests)
+   :jobs 1                    ; number of namespaces to mutate in parallel
    :dry-run false
    :verbose false
    :resume false              ; reuse valid checkpoint entries, skip re-running
@@ -45,6 +46,9 @@
     :parse-fn keyword]
    [nil "--timeout MS" "Per-mutation timeout (ms)"
     :parse-fn #(Long/parseLong %)
+    :validate [pos? "Must be positive"]]
+   [nil "--jobs N" "Number of namespaces to mutate in parallel (default: 1)"
+    :parse-fn #(Integer/parseInt %)
     :validate [pos? "Must be positive"]]
    [nil "--output-dir DIR" "Report output directory"]
    [nil "--dry-run" "Show mutation count without running"]

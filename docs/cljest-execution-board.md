@@ -35,7 +35,8 @@ Every one of those is a gap to close *inside* cljest. This board does that.
 |---|---|---|---|---|---|
 | CLJEST-PERF-001 | P0 | DONE | — | **Coverage-guided test selection.** Today every mutant reruns *all* matched test namespaces (`runner.clj:74`). Capture per-test line/form coverage once, then for each mutant run only the tests that exercise the mutated site. | ✅ Mutants run only covering tests, with all-tests fallback on unknown coverage; verdicts identical to full-run on fixture + real namespaces; ≥3× on benchmark, 2.0× on a real 29-min namespace. Evidence in Progress Log 2026-05-21. |
 | CLJEST-ISO-001 | P0 | DONE | — | **Out-of-tree mutation.** Stop `spit`-ing mutants into the working `src/`. Apply each mutant in-memory via `load-string` (re-evaluates the full mutated file text); the real source file is read-only input. | ✅ `kill -9` mid-run leaves source pristine (vs 0.1.0 which leaves it mutated); verdicts unchanged (fixture 16/6, real pagination 26/2); contamination guard no longer needed. Evidence in Progress Log 2026-05-21. |
-| CLJEST-PERF-002 | P0 | TODO | ISO-001 | **Native parallel execution.** Add a `--jobs N` worker pool that runs namespaces (and/or mutation batches) concurrently, each with isolated tmp/DB/source. Removes the need for external Docker sharding. | Repo-wide sweep parallelizes in-process to core count; near-linear speedup to ~16 jobs; no shared-state corruption (DB/tmp). |
+| CLJEST-PERF-002 | P0 | DONE | ISO-001 | **Native parallel execution.** `--jobs N` worker pool launches each namespace as an independent raw `java` subprocess (classpath/prep resolved once, not per call). Removes the need for external Docker sharding for source isolation. | ✅ **6.54× at 8 jobs** (near-linear, 82% eff.) on independent workloads; verdicts unchanged; tree clean. Speedup is bounded by a project's own shared test state — see CLJEST-ISO-002. Evidence in Progress Log 2026-05-21. |
+| CLJEST-ISO-002 | P1 | TODO | PERF-002 | **Per-worker private `/tmp`.** Projects whose tests hardcode shared absolute paths (e.g. `/tmp/foo.db`) serialize under `--jobs` on SQLite/file locks; per-slot `java.io.tmpdir` can't redirect hardcoded `/tmp`. Give each worker subprocess a private `/tmp` (mount namespace where permitted, else document Docker-per-shard). | A project with hardcoded `/tmp` test paths parallelizes near-linearly under `--jobs`; or a clear documented fallback. |
 | CLJEST-PERF-003 | P1 | TODO | PERF-002 | **Warm worker JVMs.** Reuse pre-warmed project JVM(s) across namespaces instead of a cold `eval-in-project` per namespace; recycle on leak/wedge. | Per-namespace cold-start cost amortized; measured wall-clock reduction on the full sweep; wedge recovery still safe (halt + respawn). |
 | CLJEST-ROB-001 | P1 | TODO | — | **Mutation-level streaming + resume.** Stream each result to disk as it completes (`runner.clj:127` writes once at the end); extend checkpoint to mutation granularity. | Kill mid-namespace, `--resume` re-runs only the unfinished mutants of that namespace, not the whole namespace. |
 | CLJEST-INC-001 | P1 | TODO | — | **Git-diff-aware incremental mode.** `--since REF` mutates only sites on lines changed vs a ref. | PR-scoped run mutates only changed code; documented; verdicts match a full run restricted to those sites. |
@@ -100,3 +101,21 @@ EQV-001 (equivalents), RPT-002 (JSON+trend), DX-001 (GH Action), OPS-001
   Consequence: the `git checkout HEAD -- src/` contamination guard is no longer
   needed in any launcher/workflow, and CLJEST-PERF-002 (parallel execution) is
   unblocked — concurrent mutants can no longer corrupt a shared checkout.
+- 2026-05-22: `CLJEST-PERF-002` DONE. `--jobs N` runs namespaces on a fixed
+  daemon thread pool; each namespace launches as an independent raw `java …
+  clojure.main` subprocess (`runner/run-subprocess!`) using a classpath + JVM
+  args resolved exactly ONCE (`runner/prepare-launch-context`, which preps the
+  project a single time). This replaced per-namespace `eval-in-project`, whose
+  per-call prep (javac/compile) both *raced* (`Wrong number of arguments to
+  javac task`) and *serialized* parallel workers — measured as ~1 concurrent
+  JVM even at `--jobs 8`. Per-slot `java.io.tmpdir` isolates scratch dirs.
+  Validation:
+  - Independent 8-namespace fixture: jobs=1 51.4s → jobs=8 7.9s = **6.54×**,
+    peak concurrency saturated. Verdicts unchanged; tree clean.
+  - Real chengis 8-namespace subset: verdicts match sequential
+    (215–216 killed / 205 survived / 51.7%, ±1 timeout-tail), tree clean — but
+    **no speedup** because chengis tests hardcode shared `/tmp/chengis-*.db`
+    paths and contend on SQLite locks (`busy_timeout=5000`); more concurrency
+    made it *slower*. This is a project test-isolation limit (the reason the
+    original baseline used Docker private `/tmp`), tracked as CLJEST-ISO-002.
+  Net: near-linear parallelism for isolation-clean suites; no harm otherwise.

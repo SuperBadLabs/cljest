@@ -97,9 +97,25 @@ Add a `:cljest` key to your `project.clj`:
   --output-dir DIR            Report output directory [default: target/cljest]
   --dry-run                   Show mutation count without running
   --no-coverage               Disable coverage-guided test selection
+  --jobs N                    Mutate N namespaces in parallel [default: 1]
   --verbose                   Verbose output
   --help                      Show help
 ```
+
+## Parallel Execution
+
+`--jobs N` mutates N namespaces concurrently. Each namespace is launched as an
+independent `java` subprocess using a classpath that's resolved once up front,
+so there's no shared in-process state between workers — mutants are applied
+in-memory (so the source tree is read-only and safe to share) and each worker
+gets its own `java.io.tmpdir`. On independent workloads this scales near-linearly
+(~6.5× at `--jobs 8`).
+
+Caveat: if your **tests** share mutable state across namespaces — e.g. they
+hardcode an absolute path like `/tmp/app.db` rather than deriving it from
+`java.io.tmpdir` — concurrent workers will contend on that shared resource and
+parallelism won't help (and may hurt). Prefer per-test temp paths derived from
+`java.io.tmpdir`, or run shards in separate containers with a private `/tmp`.
 
 ## Mutation Operators
 

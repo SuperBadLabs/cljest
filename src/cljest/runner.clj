@@ -11,6 +11,8 @@
             [cljest.mutator :as mutator]
             [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.string :as str]
+            [leiningen.core.classpath :as lcp]
             [leiningen.core.eval :as eval]
             [leiningen.core.main :as main]))
 
@@ -221,10 +223,62 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- make-results-file
-  "Generate a unique temp file path for results."
+  "Generate a unique temp file path for results (safe under parallel jobs)."
   []
   (str (System/getProperty "java.io.tmpdir")
-       "/cljest-results-" (System/nanoTime) ".edn"))
+       "/cljest-results-" (System/nanoTime) "-" (java.util.UUID/randomUUID) ".edn"))
+
+(defn- worker-slot
+  "Derive this worker's slot id from its thread name (cljest-worker-N), or
+   \"0\" when running on the calling thread (sequential mode)."
+  []
+  (let [n (.getName (Thread/currentThread))]
+    (if-let [m (re-find #"cljest-worker-(\d+)" n)]
+      (second m)
+      "0")))
+
+(defn prepare-launch-context
+  "Compile the project and resolve the classpath + JVM args ONCE, so each
+   namespace can be launched as an independent raw `java` subprocess.
+
+   Leiningen's `eval-in-project` re-runs prep (javac/compile) and rebuilds the
+   classpath inside the parent JVM on every call, which serializes (and races)
+   when invoked from parallel workers — measured as ~1 concurrent worker even
+   with --jobs 8. Doing that work once and launching bare subprocesses removes
+   the shared parent bottleneck entirely.
+
+   Returns {:classpath <cp string> :jvm-args [..] :target-path <dir>}."
+  [project]
+  (eval/prep project)
+  (let [jvm-args (if-let [f (resolve 'leiningen.core.eval/get-jvm-args)]
+                   (vec (f project))
+                   (vec (:jvm-opts project)))]
+    {:classpath (str/join java.io.File/pathSeparator (lcp/get-classpath project))
+     :jvm-args jvm-args
+     :target-path (or (:target-path project) "target")}))
+
+(defn- run-subprocess!
+  "Launch `form` in a fresh JVM via clojure.main using the precomputed
+   classpath/JVM args, with a per-worker java.io.tmpdir. Blocks until the
+   process exits (the form writes its results file and halts). Returns the
+   exit code."
+  [launch-ctx slot form]
+  (let [tmp (str (:target-path launch-ctx) "/cljest-par/slot-" slot "/tmp")
+        _ (.mkdirs (io/file tmp))
+        form-file (java.io.File/createTempFile "cljest-form-" ".clj")
+        cmd (-> ["java"]
+                (into (:jvm-args launch-ctx))
+                (conj (str "-Djava.io.tmpdir=" tmp))
+                (into ["-cp" (:classpath launch-ctx)
+                       "clojure.main" (.getAbsolutePath form-file)]))]
+    (spit form-file (pr-str form))
+    (try
+      (let [pb (doto (ProcessBuilder. ^java.util.List cmd)
+                 (.redirectOutput java.lang.ProcessBuilder$Redirect/DISCARD)
+                 (.redirectError java.lang.ProcessBuilder$Redirect/INHERIT))]
+        (.waitFor (.start pb)))
+      (finally
+        (.delete form-file)))))
 
 (defn run-mutations-for-namespace
   "Run all mutations for a source namespace.
@@ -235,7 +289,8 @@
    4. Read results from temp EDN file
 
    Arguments:
-     project    — Leiningen project map
+     launch-ctx — precomputed {:classpath :jvm-args :target-path} from
+                  prepare-launch-context (classpath/prep resolved once)
      src-ns     — namespace symbol
      src-file   — absolute source file path
      test-nses  — vec of test namespace symbols
@@ -243,7 +298,7 @@
      config     — resolved config map
 
    Returns a vec of result maps with :status :killed/:survived/:timed-out/:error."
-  [project src-ns src-file test-nses mutations config]
+  [launch-ctx src-ns src-file test-nses mutations config]
   (let [results-file (make-results-file)
         timeout-ms (:timeout config 30000)
         verbose? (:verbose config)
@@ -275,16 +330,15 @@
           (main/info "  No valid mutations for" (str src-ns)))
         [])
 
-      ;; Build the form
+      ;; Build the form (self-initializing: it requires clojure.test, the test
+      ;; namespaces, and the source namespace itself).
       (let [form (build-mutation-form src-ns src-file test-nses
                                       valid-mutations timeout-ms results-file
                                       coverage?)]
-        ;; Run in project JVM
+        ;; Launch as an independent subprocess — no shared Leiningen machinery,
+        ;; so parallel workers actually run concurrently.
         (try
-          (eval/eval-in-project project form
-            `(do (require 'clojure.test)
-                 ~@(for [tns test-nses]
-                     `(require (quote ~tns)))))
+          (run-subprocess! launch-ctx (worker-slot) form)
           ;; Read results
           (let [results-raw (slurp results-file)
                 results (edn/read-string results-raw)]
