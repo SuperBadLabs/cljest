@@ -13,7 +13,29 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Set up JDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: '21'
+
+    - name: Install Leiningen
+      run: |
+        curl -fsSL https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein \
+          -o "$HOME/.local/bin/lein" --create-dirs
+        chmod +x "$HOME/.local/bin/lein"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.m2/repository
+        key: ${{ runner.os }}-m2-${{ hashFiles('project.clj') }}
+        restore-keys: ${{ runner.os }}-m2-
+
     - name: Install dependencies
       run: lein deps
+
     - name: Run tests
       run: lein test
