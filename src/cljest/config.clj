@@ -15,6 +15,7 @@
    :namespaces nil            ; nil = all source namespaces
    :exclude-namespaces nil    ; nil = no exclusions
    :operators :standard       ; :fast | :standard | :comprehensive
+   :exclude-operators nil     ; seq of operator-id keywords to drop (equivalent mutants, EQV-001)
    :threshold 80              ; minimum mutation score (%)
    :timeout 30000             ; per-mutation test timeout (ms)
    :output-dir "target/cljest"
@@ -46,6 +47,8 @@
    [nil "--operators PRESET" "Operator preset: fast, standard, comprehensive"
     :parse-fn keyword
     :validate [#{:fast :standard :comprehensive} "Must be fast, standard, or comprehensive"]]
+   [nil "--exclude-operators IDS" "Comma-separated operator IDs to drop (equivalent mutants)"
+    :parse-fn (fn [s] (mapv keyword (clojure.string/split s #",")))]
    [nil "--format FMT" "Report format: text, html, both"
     :parse-fn keyword]
    [nil "--timeout MS" "Per-mutation timeout (ms)"

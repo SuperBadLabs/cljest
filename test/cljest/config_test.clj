@@ -124,6 +124,20 @@
   (testing ":since defaults to nil (full sweep)"
     (is (nil? (:since (cfg/resolve-config {} []))))))
 
+(deftest exclude-operators-defaults-nil
+  (testing ":exclude-operators defaults to nil"
+    (is (nil? (:exclude-operators (cfg/resolve-config {} []))))))
+
+(deftest cli-exclude-operators-parses-csv
+  (testing "--exclude-operators parses a comma-separated list into keywords"
+    (let [config (cfg/resolve-config {} ["--exclude-operators" "clj-defn--defn,clj-let-swap-bindings"])]
+      (is (= [:clj-defn--defn :clj-let-swap-bindings] (:exclude-operators config))))))
+
+(deftest project-exclude-operators
+  (testing "project :cljest can set :exclude-operators"
+    (let [config (cfg/resolve-config {:cljest {:exclude-operators [:clj-defn--defn]}} [])]
+      (is (= [:clj-defn--defn] (:exclude-operators config))))))
+
 (deftest cli-since-sets-ref
   (testing "--since REF captures the git ref for incremental scoping"
     (let [config (cfg/resolve-config {} ["--since" "origin/main"])]

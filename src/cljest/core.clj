@@ -9,6 +9,7 @@
             [cljest.reporter :as reporter]
             [cljest.runner :as runner]
             [cljest.selector :as selector]
+            [clojure.set :as set]
             [clojure.string :as str]
             [leiningen.core.main :as main]))
 
@@ -92,7 +93,13 @@
         resume? (:resume config)
         checkpoint-dir (:checkpoint-dir config)
         jobs (max 1 (long (:jobs config 1)))
-        operator-ids (ops/resolve-preset (:operators config))
+        ;; Equivalence hygiene (EQV-001): drop operators the project has judged
+        ;; to produce only equivalent mutants for its code (e.g. defn-→defn,
+        ;; which is behavior-preserving in Clojure). Auditable: the excluded set
+        ;; is echoed in the banner below.
+        excluded-ops (set (:exclude-operators config))
+        operator-ids (set/difference (ops/resolve-preset (:operators config))
+                                     excluded-ops)
         start-time (System/nanoTime)]
 
     ;; Optionally wipe checkpoint before running
@@ -105,8 +112,12 @@
     (main/info "================================================================")
     (main/info "              CLJEST MUTATION TESTING")
     (main/info "================================================================")
-    (main/info (format "  Operators:  %s (%d)"
-                       (name (:operators config)) (count operator-ids)))
+    (main/info (format "  Operators:  %s (%d)%s"
+                       (name (:operators config)) (count operator-ids)
+                       (if (seq excluded-ops)
+                         (format " — excluding %d equivalent: %s"
+                                 (count excluded-ops) (str/join ", " (sort (map name excluded-ops))))
+                         "")))
     (main/info (format "  Threshold:  %d%%" (:threshold config)))
     (main/info (format "  Timeout:    %dms" (:timeout config)))
     (when dry-run? (main/info "  Mode:       DRY RUN"))
