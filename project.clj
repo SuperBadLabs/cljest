@@ -1,4 +1,4 @@
-(defproject org.clojars.sremani/cljest "0.2.0-SNAPSHOT"
+(defproject org.clojars.sremani/cljest "0.2.0"
   :description "cljest — mutation testing for Clojure"
   :url "https://github.com/sremani/cljest"
   :license {:name "Apache License 2.0"

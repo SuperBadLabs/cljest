@@ -14,7 +14,7 @@ Add cljest to your project's `:plugins`:
 
 ```clojure
 ;; project.clj
-:plugins [[org.clojars.sremani/cljest "0.1.0"]]
+:plugins [[org.clojars.sremani/cljest "0.2.0"]]
 ```
 
 ## Quick Start
